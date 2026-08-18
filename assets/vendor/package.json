@@ -1,0 +1,14 @@
+{
+  "name": "canary-three-bundle",
+  "private": true,
+  "description": "Build source for three.bundle.js — bundles Three.js + GLTFLoader into one self-contained, import-free script for use inside QtWebEngine (Chromium 87, no import-map support). See README.md.",
+  "scripts": {
+    "build": "esbuild entry.js --bundle --format=iife --minify --outfile=three.bundle.js"
+  },
+  "devDependencies": {
+    "esbuild": "^0.19.0"
+  },
+  "dependencies": {
+    "three": "0.152.0"
+  }
+}

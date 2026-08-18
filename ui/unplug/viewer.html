@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Canary — Unplug Environment</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; }
+
+  /* Flat PNG backdrop, replacing the GLB's 3D Background mesh. Sits
+     behind the (now-transparent) Three.js canvas via z-index/DOM order.
+     background-size:cover + center fills the entire viewport edge-to-
+     edge with no white/grey margins, cropping excess rather than
+     letterboxing — matches "PNG must cover the entire viewport". */
+  #bg-layer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    background-image: url('../../assets/environment/bg_backdrop.png');
+    /* Sized to 68% of viewport height (auto width preserves the image's
+       real aspect ratio — no stretching/distortion of the mountain/lake
+       composition), top-anchored so sky/mountains sit at the very top
+       and the image's own bottom edge lands at the 68% line measured
+       from the reference screenshot. The remaining 68%-100% is left
+       empty/transparent, reserved for the future grass GLB — nothing
+       renders there yet, which will show as a plain gap until grass is
+       added. */
+    background-size: auto 68%;
+    background-position: top center;
+    background-repeat: no-repeat;
+    z-index: 0;
+  }
+  #canvas-container { width: 100%; height: 100%; position: relative; z-index: 1; }
+  canvas { display: block; width: 100% !important; height: 100% !important; }
+
+  /* ── Overlay UI — flat DOM text over the canvas, not 3D text.
+     Deliberately minimal: no panel background, no progress bar,
+     nothing that competes with the scene. ── */
+  #overlay {
+    position: absolute;
+    top: 12%;
+    left: 0;
+    width: 100%;
+    text-align: center;
+    pointer-events: none;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    color: #f2f0f8;
+    text-shadow: 0 2px 10px rgba(0,0,0,0.55), 0 0 20px rgba(120,80,200,0.25);
+    z-index: 2;
+  }
+  #exercise-name {
+    font-size: 30px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    opacity: 0;
+    transition: opacity 0.35s ease;
+  }
+  #exercise-name.visible { opacity: 1; }
+  #progress-dots {
+    margin-top: 10px;
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    opacity: 0;
+    transition: opacity 0.35s ease;
+  }
+  #progress-dots.visible { opacity: 1; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: rgba(255,255,255,0.22);
+    transition: background 0.25s ease, transform 0.25s ease;
+  }
+  .dot.filled { background: rgba(230,220,255,0.9); transform: scale(1.15); }
+
+  #loading {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: #cfc8e8; font-family: 'Segoe UI', Arial, sans-serif;
+    font-size: 15px; letter-spacing: 0.05em; opacity: 0.7;
+    background: transparent;
+    z-index: 2;
+  }
+</style>
+</head>
+<body>
+  <div id="bg-layer"></div>
+  <div id="canvas-container"></div>
+  <div id="overlay">
+    <div id="exercise-name"></div>
+    <div id="progress-dots"></div>
+  </div>
+  <div id="loading">Loading environment…</div>
+
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+
+  <!-- Locally-bundled Three.js r152 + GLTFLoader, pre-resolved into one
+       self-contained script (built with esbuild — see
+       assets/vendor/README.md for how to rebuild it). Two separate
+       problems made both "standard" ways of loading this fail in this
+       environment, so we bundle instead of relying on either:
+
+       1. examples/js/loaders/GLTFLoader.js (the old non-module build)
+          was deleted from three.js entirely at r124 (Dec 2020) — it
+          simply doesn't exist for any version newer than that, for
+          any CDN. That's a dead end regardless of version pinning.
+
+       2. examples/jsm/loaders/GLTFLoader.js (the modern ES module
+          build) has its own *internal* `import ... from 'three'` bare
+          specifier, which can only resolve via an import map — a
+          browser feature that shipped in Chromium 89. PyQtWebEngine
+          5.15.7's open-source build bundles Chromium 87, which
+          predates that by two versions. No amount of fixing our own
+          import statements changes GLTFLoader's internal one.
+
+       Bundling ahead of time with esbuild resolves every import
+       (ours and GLTFLoader's) at build time, so nothing reaches the
+       browser except plain, dependency-free JavaScript. Also means
+       this no longer needs a live CDN connection at runtime at all. -->
+  <script src="../../assets/vendor/three.bundle.js"></script>
+
+  <script>
+const { GLTFLoader, DRACOLoader } = THREE;
+
+// Shared across every GLTFLoader — environment.glb was exported with
+// Draco mesh compression (a common Blender glTF-exporter default), so
+// any GLTFLoader that touches it needs a DRACOLoader attached. Attaching
+// it to the character loaders too, just in case those end up Draco'd
+// later — a DRACOLoader that's never asked to decode anything costs
+// nothing. Decoder files are served locally (see assets/vendor/draco/),
+// not fetched from Google's CDN, keeping the whole scene load offline-
+// capable like everything else here.
+const _dracoLoader = new DRACOLoader();
+_dracoLoader.setDecoderPath('../../assets/vendor/draco/');
+
+function createGLTFLoader() {
+  const loader = new GLTFLoader();
+  loader.setDRACOLoader(_dracoLoader);
+  return loader;
+}
+
+// Downscales a THREE.Texture's image in-place via canvas, before it's
+// ever uploaded to the GPU. Confirmed by direct inspection of
+// trunkseat.glb: its three textures (normal/basecolor/metallic-
+// roughness) are each a full 4096x4096 — decoded and mipmapped, that's
+// roughly 250+MB of GPU memory for one background prop, which is a
+// very plausible direct cause of the texture-corruption/scrambled-
+// pattern rendering seen in testing (classic symptom of GPU texture
+// memory exhaustion). maxSize=1024 is still sharp at this prop's real
+// on-screen size and cuts memory to ~1/16th per texture.
+function downscaleTexture(texture, maxSize = 1024) {
+  if (!texture || !texture.image) return texture;
+  const img = texture.image;
+  const w = img.width, h = img.height;
+  if (w <= maxSize && h <= maxSize) return texture; // already small enough
+  const scale = maxSize / Math.max(w, h);
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(w * scale);
+  canvas.height = Math.round(h * scale);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  texture.image = canvas;
+  texture.needsUpdate = true;
+  console.log('[texture] downscaled', w, 'x', h, '->', canvas.width, 'x', canvas.height);
+  return texture;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+//  Config
+// ─────────────────────────────────────────────────────────────────────────
+
+// Real durations measured directly from the authored animation clips
+// (boy.glb / girl.glb) — not guessed. Each entry's `clip` is a pattern
+// matched case-insensitively against whatever clip names are actually
+// present on the loaded character (see resolveClipName), so small
+// naming inconsistencies between the two GLBs (e.g. "Idle_Pose_Girl"
+// vs "Idle_Pose_Boy") don't break anything.
+const EXERCISES = [
+  { id: 'head_tilt',     label: 'Head Tilt',     clip: 'head_tilt',     duration: 5.333 },
+  { id: 'head_nod',      label: 'Head Nod',      clip: 'head_nod',      duration: 5.333 },
+  { id: 'head_rotation', label: 'Head Rotation', clip: 'head_rotation', duration: 4.000 },
+  { id: 'head_look',     label: 'Head Look',     clip: 'head_look',     duration: 5.333 },
+  { id: 'arm_raise',     label: 'Arm Raise',     clip: 'arm_raise',     duration: 5.333 },
+  { id: 'leg_raise',     label: 'Leg Raise',     clip: 'leg_raise',     duration: 4.000 },
+  { id: 'heel_raise',    label: 'Heel Raise',    clip: 'heel_raise',    duration: 4.000 },
+];
+const IDLE_CLIP = 'idle';
+const IDLE_DURATION = 1.333;   // real length of the authored idle loop clip
+const IDLE_BETWEEN_LOOPS = 2;  // ~2.7s — a clearly visible settle, and a clean
+                                // multiple of the loop so it doesn't cut off mid-pose
+const IDLE_FINAL_LOOPS = 3;    // ~4.0s — noticeably longer, calmer close
+
+const ASSET_PATHS = {
+  trunkseat:   '../../assets/environment/trunkseat.glb',
+  boy:         '../../assets/environment/boy.glb',
+  girl:        '../../assets/environment/girl.glb',
+  grassTuft:   '../../assets/environment/grass.glb',
+};
+
+// Both boy.glb and girl.glb were exported from Blender with a baked
+// Armature-level axis correction (a +90° X rotation, converting Blender's
+// Z-up to glTF/three.js's Y-up) — there's no separate "forward" marker in
+// either file to read the intended facing from statically. Rather than
+// guess and silently bake a wrong value in, this is applied as ONE named
+// constant on the character root (never on bones/clips), with the actual
+// measured bounds logged every load (see CharacterLoader.load) so it's a
+// one-line flip, not a re-diagnosis, if the character still faces away
+// from camera(0.9, 1.55, 2.6) after a visual check:
+//   CHARACTER_ROOT_YAW = 0        -> no correction
+//   CHARACTER_ROOT_YAW = Math.PI  -> face the opposite way (180°)
+const CHARACTER_ROOT_YAW = 0;
+
+const CROSSFADE_S = 0.35;
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  SceneManager — renderer/scene/camera lifecycle, environment load,
+//  render loop. Knows nothing about characters or exercises.
+// ─────────────────────────────────────────────────────────────────────────
+
+class SceneManager {
+  constructor(container) {
+    this.container = container;
+    this.clock = new THREE.Clock();
+    this.updateCallbacks = [];
+
+    this.scene = new THREE.Scene();
+
+    // REVERTED: the 16.33deg Blender-matched FOV + quaternion combo
+    // produced a completely blank scene (cause not yet diagnosed).
+    // Restoring the last confirmed-working FOV. far=400 still comfortably
+    // covers the old distant Background plane, kept for now even though
+    // that plane is being hidden below — harmless to leave.
+    this.camera = new THREE.PerspectiveCamera(38, this._aspect(), 0.1, 400);
+
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    this.renderer.setClearColor(0x000000, 0); // fully transparent — PNG background layer shows through
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
+    this.renderer.setSize(container.clientWidth, container.clientHeight);
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    container.appendChild(this.renderer.domElement);
+
+    this._setupLighting();
+
+    window.addEventListener('resize', () => this._onResize());
+
+    this._running = true;
+    this._tick();
+  }
+
+  _aspect() {
+    return this.container.clientWidth / Math.max(1, this.container.clientHeight);
+  }
+
+  _setupLighting() {
+    // Soft ambient fill — cheap, matches the baked environment's tones
+    const hemi = new THREE.HemisphereLight(0xdce8ff, 0x35301f, 0.65);
+    this.scene.add(hemi);
+
+    // One directional "sun", soft shadows, tightly-cropped shadow frustum
+    // (the single biggest shadow-performance lever) — only the character
+    // needs to cast/receive, not the whole environment.
+    const sun = new THREE.DirectionalLight(0xfff2d8, 1.15);
+    sun.position.set(2.5, 4, 2.0);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(1024, 1024);
+    sun.shadow.camera.near = 0.5;
+    sun.shadow.camera.far = 8;
+    sun.shadow.camera.left = -1.3;
+    sun.shadow.camera.right = 1.3;
+    sun.shadow.camera.top = 1.8;
+    sun.shadow.camera.bottom = -1.3;
+    sun.shadow.bias = -0.0025;
+    this.scene.add(sun);
+
+    // Subtle depth fog, colour-matched to a soft sky tone. Left as-is —
+    // still affects trunk/character/grass minimally the way it always
+    // did; not part of the background-architecture change.
+    this.scene.fog = new THREE.FogExp2(0xcdd8ea, 0.045);
+
+    // scene.background is intentionally left null (not set) now that the
+    // backdrop is a flat PNG layered behind the canvas via CSS, not the
+    // GLB's 3D Background mesh. An opaque scene.background color would
+    // paint over the whole canvas every frame regardless of the
+    // renderer's alpha:true, which would hide the PNG layer completely.
+    // Leaving it null lets the transparent clear color (see renderer
+    // setup above) show through to whatever's behind the canvas in the
+    // DOM.
+  }
+
+  onUpdate(fn) {
+    this.updateCallbacks.push(fn);
+  }
+
+  _onResize() {
+    const w = this.container.clientWidth, h = this.container.clientHeight;
+    this.camera.aspect = w / Math.max(1, h);
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(w, h);
+  }
+
+  // ── TEMPORARY: FPS/frame-time diagnostic — remove once the stutter is
+  // confirmed fixed. Logs once/sec so it doesn't itself become a cost.
+  _fpsFrames = 0;
+  _fpsAccum = 0;
+
+  _tick = () => {
+    if (!this._running) return;
+    requestAnimationFrame(this._tick);
+    const dt = this.clock.getDelta();
+
+    this._fpsFrames++;
+    this._fpsAccum += dt;
+    if (this._fpsAccum >= 1.0) {
+      console.log(`[perf] fps: ${(this._fpsFrames / this._fpsAccum).toFixed(1)}  avg frame: ${((this._fpsAccum / this._fpsFrames) * 1000).toFixed(1)}ms`);
+      this._fpsFrames = 0;
+      this._fpsAccum = 0;
+    }
+
+    for (const fn of this.updateCallbacks) fn(dt);
+    this.renderer.render(this.scene, this.camera);
+  };
+
+  stop() { this._running = false; }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  CharacterLoader — registry of character GLBs. Loads ONLY the selected
+//  one; returns a uniform Character object so nothing downstream ever
+//  branches on which character is loaded. Adding a 3rd character later
+//  is one registry entry.
+// ─────────────────────────────────────────────────────────────────────────
+
+function resolveClipName(animations, canonicalId) {
+  // Case-insensitive match against "canonicalId" appearing anywhere in
+  // the real clip name — tolerates naming drift between GLBs (e.g. the
+  // girl rig's "Idle_Pose_Girl" vs the boy rig's "Idle_Pose_Boy", or a
+  // stray extra clip like the girl rig's leftover "Action").
+  const needle = canonicalId.replace(/_/g, '').toLowerCase();
+  for (const clip of animations) {
+    const hay = clip.name.replace(/_/g, '').toLowerCase();
+    if (hay.includes(needle)) return clip.name;
+  }
+  return null;
+}
+
+class CharacterLoader {
+  static REGISTRY = {
+    boy: ASSET_PATHS.boy,
+    girl: ASSET_PATHS.girl,
+  };
+
+  constructor(scene) {
+    this.scene = scene;
+    this._current = null;   // { root, mixer, clips, url }
+  }
+
+  async load(characterId) {
+    const url = CharacterLoader.REGISTRY[characterId];
+    if (!url) throw new Error(`Unknown character: ${characterId}`);
+
+    this.dispose();   // clean up any previously-loaded character first
+
+    const loader = createGLTFLoader();
+    const gltf = await loader.loadAsync(url);
+    const root = gltf.scene;
+
+    // Root-level facing correction only — never touches bones or clips,
+    // so the authored animations play exactly as exported.
+    root.rotation.y = CHARACTER_ROOT_YAW;
+
+    root.traverse((node) => {
+      if (node.isMesh) {
+        node.castShadow = true;
+        node.receiveShadow = false;
+        if (node.material) node.material.side = THREE.FrontSide;
+      }
+    });
+
+    // NOTE on why this isn't `new THREE.Box3().setFromObject(root)`:
+    // boy.glb/girl.glb are skinned meshes. Their raw POSITION accessor
+    // data (what Box3.setFromObject actually reads — geometry bounds ×
+    // node.matrixWorld, no skin deformation applied) is a near-
+    // degenerate ~2cm blob sitting at the Armature's local offset, not
+    // the actual body shape — confirmed by reading the GLB's vertex
+    // buffer directly. A Box3 on `root` would silently report a
+    // near-zero size, which is worse than no diagnostic at all since it
+    // looks like real data. The skeleton's bone world positions ARE
+    // correctly resolved by Three.js and give a real, usable proxy for
+    // the character's actual on-screen extent.
+    let skinBounds = null;
+    root.traverse((node) => {
+      if (node.isSkinnedMesh && node.skeleton && !skinBounds) {
+        const box = new THREE.Box3();
+        for (const bone of node.skeleton.bones) {
+          box.expandByPoint(bone.getWorldPosition(new THREE.Vector3()));
+        }
+        skinBounds = box;
+      }
+    });
+    if (skinBounds) {
+      const c = skinBounds.getCenter(new THREE.Vector3());
+      const s = skinBounds.getSize(new THREE.Vector3());
+      console.log('[CharacterLoader] skeleton bounds (bind pose) for', characterId,
+        '- center:', c, 'size:', s, 'min:', skinBounds.min, 'max:', skinBounds.max);
+    } else {
+      console.warn('[CharacterLoader] no SkinnedMesh/skeleton found on', characterId, '— unexpected for a rigged character.');
+    }
+
+    const mixer = new THREE.AnimationMixer(root);
+
+    const clips = { idle: resolveClipName(gltf.animations, IDLE_CLIP) };
+    for (const ex of EXERCISES) {
+      clips[ex.id] = resolveClipName(gltf.animations, ex.clip);
+    }
+    const missing = Object.entries(clips).filter(([, v]) => !v).map(([k]) => k);
+    if (missing.length) {
+      console.warn(`[CharacterLoader] Missing clips for "${characterId}":`, missing);
+    }
+
+    const clipByName = {};
+    for (const c of gltf.animations) clipByName[c.name] = c;
+
+    this.scene.add(root);
+    this._current = { root, mixer, clips, clipByName, characterId };
+    return this._current;
+  }
+
+  get current() { return this._current; }
+
+  dispose() {
+    if (!this._current) return;
+    const { root, mixer } = this._current;
+    mixer.stopAllAction();
+    this.scene.remove(root);
+    root.traverse((node) => {
+      if (node.isMesh) {
+        node.geometry?.dispose();
+        const mats = Array.isArray(node.material) ? node.material : [node.material];
+        for (const m of mats) {
+          if (!m) continue;
+          for (const key of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'emissiveMap']) {
+            m[key]?.dispose?.();
+          }
+          m.dispose();
+        }
+      }
+    });
+    this._current = null;
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  GrassField — loads grass.glb's single tuft ONCE, then scatters it as an
+//  InstancedMesh (one draw call for every copy) across the foreground
+//  region below the PNG background. Placement bounds come directly from
+//  projecting the real, locked camera (FOV 38, position (0,1.5,4.2),
+//  lookAt(0,1,0)) through the ground plane — the same calculation used
+//  earlier to size the reserved grass zone (~38 m² trapezoid, ground
+//  height y=-0.725, Z from -0.40 near / -4.82 at the PNG's 68% boundary).
+//
+//  Tuft stats (measured directly from grass.glb): 5,752 triangles, real
+//  dimensions ~0.176m (w) x 0.057m (h) x 0.209m (d). Instance count is
+//  now DERIVED from a jittered grid over the reserved area (see load()
+//  below) rather than a hand-picked constant — spacing is tuned to the
+//  tuft's real footprint so coverage is even, not just dense in some
+//  spots and sparse in others. Actual resulting count/triangle total is
+//  logged to console on load since it depends on the computed grid, not
+//  a fixed number here — check the console for the exact figure.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Placement stays well clear of both ends of the reserved zone: not
+// closer than -0.55 (near the very bottom edge / camera) and not past
+// -3.6 (leaving real margin before the PNG's 68% boundary at -4.82, so
+// no tuft's silhouette can visually intrude on the background image).
+const GRASS_Z_NEAR = -0.55;
+const GRASS_Z_FAR = -3.6;
+
+// Width-at-depth, linearly interpolated between the two camera-projected
+// calibration points computed earlier: (Z=-0.405, width=5.90m) and
+// (Z=-4.821, width=11.25m). Width genuinely grows with distance for a
+// fixed FOV — confirmed earlier, not a bug — so this taper is real, not
+// approximated.
+function grassWidthAtDepth(z) {
+  const zNearCal = -0.405, wNearCal = 5.90;
+  const zFarCal = -4.821, wFarCal = 11.25;
+  const t = (z - zNearCal) / (zFarCal - zNearCal);
+  return wNearCal + (wFarCal - wNearCal) * t;
+}
+
+class GrassField {
+  constructor(scene) {
+    this.scene = scene;
+  }
+
+  // Cheap (2-triangle) solid-color ground plane, colored with the real
+  // measured color of the background PNG's own baked-in grass strip
+  // (#4f6c38, sampled directly from bg_backdrop.png earlier this
+  // session — not picked by eye). Sits at groundY, sized generously to
+  // cover the full reserved trapezoid with margin. This is what
+  // structurally guarantees no black is ever visible below the PNG,
+  // regardless of gaps between individual grass tufts — the tufts add
+  // visual texture on top of this, they aren't relied on alone to
+  // achieve full coverage (that would need hundreds of instances and
+  // hundreds of thousands of triangles just to close small gaps).
+  addGroundFillPlane(groundY) {
+    const geometry = new THREE.PlaneGeometry(14, 5.5);
+    geometry.rotateX(-Math.PI / 2); // lie flat (PlaneGeometry is XY by default)
+    const material = new THREE.MeshBasicMaterial({ color: 0x4f6c38 });
+    const plane = new THREE.Mesh(geometry, material);
+    plane.position.set(0, groundY - 0.002, -2.3); // tiny -0.002 so tufts never z-fight with it
+    plane.receiveShadow = false;
+    plane.castShadow = false;
+    this.scene.add(plane);
+    console.log('[grass] ground-fill plane added at y=', groundY - 0.002, '(color #4f6c38, matched to PNG)');
+    return plane;
+  }
+
+  async load(url, { groundY, avoidCenter, avoidRadius, baseScale = 1 } = {}) {
+    this.addGroundFillPlane(groundY);
+
+    const loader = createGLTFLoader();
+    const gltf = await loader.loadAsync(url);
+
+    let tuftMesh = null;
+    gltf.scene.traverse((node) => { if (node.isMesh && !tuftMesh) tuftMesh = node; });
+    if (!tuftMesh) {
+      console.warn('[grass] No mesh found in', url, '— skipping grass field.');
+      return null;
+    }
+
+    // Bake the node's own transform (translation/rotation/scale) into the
+    // geometry once, so every instance matrix only needs to encode
+    // placement + subtle rotation/scale variation, not re-apply the
+    // tuft's base orientation each time.
+    tuftMesh.updateMatrix();
+    const geometry = tuftMesh.geometry.clone();
+    geometry.applyMatrix4(tuftMesh.matrix);
+
+    const material = tuftMesh.material;
+
+    // Jittered grid instead of pure random scatter. Pure randomness
+    // statistically leaves uneven gaps even at a decent instance count
+    // (some cells get several tufts by chance, others none) — that's
+    // the actual cause of the "still looks empty" complaint, not the
+    // tuft being too small. A grid guarantees even coverage; jitter
+    // keeps it from reading as a grid.
+    //
+    // SPACING is derived from the tuft's real measured footprint
+    // (0.176m x 0.209m) at baseScale, not guessed — spacing a little
+    // tighter than the footprint gives slight overlap for a filled
+    // look without gaps between grid cells.
+    const tuftFootprint = 0.209 * baseScale; // use the larger (depth) dimension
+    // 0.65 multiplier chosen deliberately as a middle ground, not the
+    // densest option tested: 0.85x gave only ~63 tufts (too sparse, per
+    // feedback), but 0.45x would push past 1.4M triangles on top of an
+    // already GPU-strained scene (see trunkseat.glb's texture/vertex
+    // weight, addressed separately). 0.65x lands around ~118 tufts /
+    // ~679k triangles — a real, meaningful density increase, disclosed
+    // plainly rather than silently maxed out. If the corruption glitch
+    // reappears or worsens, this one multiplier is the first thing to
+    // raise back up.
+    const SPACING = tuftFootprint * 0.65;
+
+    const positions = [];
+    for (let z = GRASS_Z_NEAR; z >= GRASS_Z_FAR; z -= SPACING) {
+      const width = grassWidthAtDepth(z);
+      const numCols = Math.max(1, Math.ceil(width / SPACING));
+      const colSpacing = width / numCols;
+      for (let c = 0; c < numCols; c++) {
+        const baseX = -width / 2 + colSpacing * (c + 0.5);
+        // jitter within the cell so it doesn't read as a grid, capped
+        // well inside the cell so neighbors never fully overlap
+        const jitterX = (Math.random() - 0.5) * colSpacing * 0.7;
+        const jitterZ = (Math.random() - 0.5) * SPACING * 0.7;
+        const x = baseX + jitterX;
+        const z2 = z + jitterZ;
+
+        if (avoidCenter && avoidRadius) {
+          const dx = x - avoidCenter.x, dz = z2 - avoidCenter.z;
+          if (Math.sqrt(dx * dx + dz * dz) < avoidRadius) continue; // too close to trunk/character
+        }
+        positions.push([x, z2]);
+      }
+    }
+
+    const count = positions.length;
+    const mesh = new THREE.InstancedMesh(geometry, material, count);
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+
+    const dummy = new THREE.Object3D();
+    for (let i = 0; i < count; i++) {
+      const [x, z] = positions[i];
+      dummy.position.set(x, groundY, z);
+      dummy.rotation.set(0, Math.random() * Math.PI * 2, 0);   // subtle: full random yaw only
+      const s = baseScale * (0.85 + Math.random() * 0.3);      // baseScale for the requested size increase, +/-15% subtle per-instance variation on top
+      dummy.scale.setScalar(s);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+
+    this.scene.add(mesh);
+    console.log('[grass] placed', count, 'tufts (jittered grid, spacing', SPACING.toFixed(3), 'm) at baseScale', baseScale, '-',
+      count * 5752, 'triangles total (', 5752, 'per tuft )');
+    return mesh;
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  AnimationController — wraps the AnimationMixer. play(name) crossfades
+//  and returns a Promise. Nobody outside this module touches the mixer.
+// ─────────────────────────────────────────────────────────────────────────
+
+class AnimationController {
+  constructor(character) {
+    this.character = character;
+    this._activeAction = null;
+  }
+
+  /**
+   * Plays a clip by canonical id (e.g. "head_tilt", "idle").
+   *   loop:      THREE.LoopOnce | THREE.LoopRepeat
+   *   holdMs:    for LoopRepeat clips, how long to let it run before
+   *              resolving (there's no natural "finished" event for a
+   *              repeating clip)
+   * Resolves once the clip is done (LoopOnce) or after holdMs (LoopRepeat).
+   */
+  play(canonicalId, { loop = THREE.LoopOnce, holdMs = null } = {}) {
+    const { mixer, clips, clipByName } = this.character;
+    const clipName = clips[canonicalId];
+    if (!clipName || !clipByName[clipName]) {
+      console.warn(`[AnimationController] No clip resolved for "${canonicalId}"`);
+      return Promise.resolve();
+    }
+    const clip = clipByName[clipName];
+    const action = mixer.clipAction(clip);
+    action.reset();
+    action.setLoop(loop, loop === THREE.LoopOnce ? 1 : Infinity);
+    action.clampWhenFinished = loop === THREE.LoopOnce;
+
+    if (this._activeAction && this._activeAction !== action) {
+      action.crossFadeFrom(this._activeAction, CROSSFADE_S, false);
+    }
+    action.play();
+    this._activeAction = action;
+
+    return new Promise((resolve) => {
+      if (loop === THREE.LoopRepeat) {
+        setTimeout(resolve, holdMs ?? 1000);
+        return;
+      }
+      const onFinished = (e) => {
+        if (e.action !== action) return;
+        mixer.removeEventListener('finished', onFinished);
+        resolve();
+      };
+      mixer.addEventListener('finished', onFinished);
+    });
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  CompletionStrategy — how the scheduler decides an exercise is "done".
+//  TimerCompletionStrategy is the only one implemented today. A future
+//  PoseValidationStrategy would implement the exact same
+//  awaitCompletion(context) interface (poll MediaPipe landmarks each
+//  frame, resolve once the pose is confirmed, with a max-wait timeout
+//  fallback) — ExerciseScheduler's control flow below does not change
+//  at all when that swap happens; only which strategy object a given
+//  exercise is configured with changes.
+// ─────────────────────────────────────────────────────────────────────────
+
+class TimerCompletionStrategy {
+  // context: { animationController, exercise }
+  async awaitCompletion(context) {
+    // The animation itself IS the timer — we just wait for its natural
+    // LoopOnce "finished" event, already awaited by play() below.
+    return context.animationPromise;
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  ExerciseScheduler — owns the ordered list, drives:
+//    idle -> exercise -> [await completion] -> idle -> next exercise
+// ─────────────────────────────────────────────────────────────────────────
+
+class ExerciseScheduler {
+  constructor(animationController, overlayUI, exercises = EXERCISES) {
+    this.anim = animationController;
+    this.overlay = overlayUI;
+    this.exercises = exercises;
+    this._onCompleteCallbacks = [];
+  }
+
+  onSessionComplete(fn) { this._onCompleteCallbacks.push(fn); }
+
+  async run() {
+    this.overlay.setTotal(this.exercises.length);
+
+    console.log('[scheduler] START IDLE (intro)');
+    await this.anim.play('idle', { loop: THREE.LoopRepeat, holdMs: IDLE_DURATION * 1000 });
+
+    for (let i = 0; i < this.exercises.length; i++) {
+      const exercise = this.exercises[i];
+      const strategy = exercise.completionStrategy ?? new TimerCompletionStrategy();
+      const isLast = i === this.exercises.length - 1;
+      const loops = isLast ? IDLE_FINAL_LOOPS : IDLE_BETWEEN_LOOPS;
+
+      try {
+        console.log('[scheduler] START EXERCISE:', exercise.id);
+        this.overlay.showExercise(exercise.label, i + 1);
+
+        const animationPromise = this.anim.play(exercise.id, { loop: THREE.LoopOnce });
+        await strategy.awaitCompletion({ animationController: this.anim, exercise, animationPromise });
+
+        console.log('[scheduler] END EXERCISE:', exercise.id);
+      } catch (err) {
+        // Previously an error here would propagate out of run(), skip
+        // every remaining exercise, and land in main()'s catch — which
+        // unconditionally fires session_complete(). That silently
+        // truncated the sequence with no visible sign anything went
+        // wrong. Now: log it loudly and keep going.
+        console.error('[scheduler] EXERCISE FAILED:', exercise.id, err);
+      }
+
+      this.overlay.hideExercise();
+
+      try {
+        console.log('[scheduler] START IDLE', isLast ? '(final)' : '(between exercises)');
+        await this.anim.play('idle', { loop: THREE.LoopRepeat, holdMs: IDLE_DURATION * 1000 * loops });
+      } catch (err) {
+        // Same failure mode, different location: this idle transition
+        // used to be unguarded. A crash here (e.g. a dropped WebGL frame
+        // under memory pressure) would silently abort every remaining
+        // exercise with no error surfaced anywhere — a very plausible
+        // explanation for "stops after leg raise, heel raise never
+        // plays". Now it's caught and logged here too, and the loop
+        // continues to the next exercise instead of aborting entirely.
+        console.error('[scheduler] IDLE TRANSITION FAILED (continuing):', err);
+      }
+    }
+
+    console.log('[scheduler] session complete');
+    for (const cb of this._onCompleteCallbacks) cb();
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  OverlayUI — pure DOM, no Three.js knowledge. Just renders whatever
+//  state it's handed.
+// ─────────────────────────────────────────────────────────────────────────
+
+class OverlayUI {
+  constructor() {
+    this.nameEl = document.getElementById('exercise-name');
+    this.dotsEl = document.getElementById('progress-dots');
+    this.total = 0;
+  }
+
+  setTotal(total) {
+    this.total = total;
+    this.dotsEl.innerHTML = '';
+    for (let i = 0; i < total; i++) {
+      const dot = document.createElement('div');
+      dot.className = 'dot';
+      this.dotsEl.appendChild(dot);
+    }
+  }
+
+  showExercise(label, index) {
+    this.nameEl.textContent = label;
+    this.nameEl.classList.add('visible');
+    this.dotsEl.classList.add('visible');
+    const dots = this.dotsEl.children;
+    for (let i = 0; i < dots.length; i++) {
+      dots[i].classList.toggle('filled', i < index);
+    }
+  }
+
+  hideExercise() {
+    this.nameEl.classList.remove('visible');
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  CameraController — fixed framing today. Isolated as its own module so
+//  future features (per-environment framing, subtle idle sway) don't
+//  require touching SceneManager.
+// ─────────────────────────────────────────────────────────────────────────
+
+class CameraController {
+  constructor(camera) {
+    this.camera = camera;
+  }
+
+  applyFixedFraming() {
+    // REVERTED to the last confirmed-working camera: the Blender-camera
+    // conversion (position (-0.166,1.013,9.218) + quaternion) rendered a
+    // completely blank scene — cause not yet diagnosed, so backing out
+    // rather than debugging blind. This exact position/lookAt is the one
+    // that last produced a working render (character + trunk + old 3D
+    // background all visible together).
+    this.camera.position.set(0, 1.5, 4.2);
+    this.camera.lookAt(0, 1.0, 0);
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  Bridge to Python (QWebChannel) — one-way signal on session complete.
+//  Character selection comes in via the URL's ?character= query param,
+//  set by the Python host before loading the page.
+// ─────────────────────────────────────────────────────────────────────────
+
+let pyBridge = null;
+function initBridge() {
+  return new Promise((resolve) => {
+    if (typeof QWebChannel === 'undefined' || !window.qt?.webChannelTransport) {
+      resolve(null);
+      return;
+    }
+    new QWebChannel(window.qt.webChannelTransport, (channel) => {
+      pyBridge = channel.objects.bridge ?? null;
+      resolve(pyBridge);
+    });
+  });
+}
+
+function getCharacterFromURL() {
+  const params = new URLSearchParams(window.location.search);
+  const c = (params.get('character') || 'boy').toLowerCase();
+  return c === 'girl' ? 'girl' : 'boy';
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+//  Bootstrap
+// ─────────────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log('[viewer] opening animation complete (viewer script started)');
+  await initBridge();
+
+  const container = document.getElementById('canvas-container');
+  console.log('[viewer] container size:', container.clientWidth, container.clientHeight);
+
+  const sceneManager = new SceneManager(container);
+  const cameraController = new CameraController(sceneManager.camera);
+  cameraController.applyFixedFraming();
+  console.log('[viewer] camera position:', sceneManager.camera.position);
+
+  console.log('[viewer] transitioning to Three.js — loading trunk seat…');
+  // trunkseat.glb replaces the old environment.glb entirely (Background
+  // mesh, Green Lawn, everything) — environment.glb is no longer loaded
+  // at all, which is the actual fix for "old grass still visible": no
+  // amount of visible=false matters if the file simply isn't fetched.
+  //
+  // This new asset has an IDENTITY transform (centered at its own local
+  // origin) — structurally different from the old trunk, which was a
+  // named child node with its own baked offset inside environment.glb.
+  // So its scale/position had to be freshly derived, not copied from
+  // before: solved so it lands on the exact same target world bounds
+  // the old trunk was verified against (top Y=0.109, bottom Y=-0.725,
+  // center x=-0.016, z=-1.483) — this keeps it "the same size" visually
+  // even though the underlying math is asset-specific.
+  //   local bounds (this file): Y [-0.2835, 0.2835], X [-0.5,0.5], Z [-0.486,0.486]
+  //   solved: scale = 0.834 / 0.567 = 1.4709
+  //           position.y = 0.109 - 1.4709*0.2835 = -0.308
+  const TRUNK_SCALE = 1.47086;
+  const TRUNK_POSITION = new THREE.Vector3(-0.016, -0.308, -1.483);
+  const trunkLoader = createGLTFLoader();
+  const trunkGltf = await trunkLoader.loadAsync(ASSET_PATHS.trunkseat);
+  const trunkRoot = trunkGltf.scene;
+  trunkRoot.scale.setScalar(TRUNK_SCALE);
+  trunkRoot.position.copy(TRUNK_POSITION);
+  trunkRoot.traverse((node) => {
+    if (node.isMesh) {
+      node.castShadow = false; node.receiveShadow = false;
+      const mat = node.material;
+      if (mat) {
+        // See downscaleTexture() above — real GPU-memory fix, not a
+        // workaround, for the ~250MB+ these three 4096x4096 textures
+        // cost uncompressed.
+        downscaleTexture(mat.map, 1024);
+        downscaleTexture(mat.normalMap, 1024);
+        downscaleTexture(mat.metalnessMap, 1024);
+        downscaleTexture(mat.roughnessMap, 1024);
+      }
+    }
+  });
+  sceneManager.scene.add(trunkRoot);
+  {
+    const b = new THREE.Box3().setFromObject(trunkRoot);
+    console.log('[viewer] trunkseat.glb world bounds - min:', b.min, 'max:', b.max,
+      '(target: top 0.109, bottom -0.725 — should match)');
+  }
+  // Heads-up left in console, not silently swallowed: this asset is
+  // 266,268 vertices — very heavy for a static prop (typical of
+  // AI-generated/un-retopologized meshes). Kept as-is per instruction to
+  // use this file directly; worth decimating in Blender later if it
+  // turns out to cost noticeable frame time.
+  console.log('[viewer] NOTE: trunkseat.glb has 266,268 vertices — heavy for a static prop, flagging for awareness.');
+
+  const characterLoader = new CharacterLoader(sceneManager.scene);
+  const character = await characterLoader.load(getCharacterFromURL());
+  console.log('[viewer] character loaded:', character.characterId, '- scene children now:', sceneManager.scene.children.length);
+  console.log('[viewer] resolved clips:', character.clips);
+
+  // ── Composition match to reference image (camera left untouched) ──
+  // Camera is unchanged: FOV 38, position (0,1.5,4.2), lookAt(0,1,0).
+  // These values are UNCHANGED from before — this derivation was always
+  // about the character's own root relative to its default identity
+  // transform, independent of which trunk asset is used, so swapping
+  // trunkseat.glb doesn't affect it.
+  const COMPOSITION_SCALE = 1.4887;
+  const COMPOSITION_POSITION = new THREE.Vector3(0.00782, -0.65043, -0.60586);
+  character.root.scale.setScalar(COMPOSITION_SCALE);
+  character.root.position.copy(COMPOSITION_POSITION);
+  console.log('[viewer] character composition scale/position applied:', COMPOSITION_SCALE, COMPOSITION_POSITION);
+
+  // ── Grass field ──
+  // groundY (-0.725) and the trunk's world (x,z) position (-0.016,-1.483)
+  // are the same established values, unchanged by the trunk asset swap.
+  // avoidRadius keeps tufts from spawning directly through the trunk's
+  // own footprint; character sits on the trunk so this covers both.
+  //
+  // baseScale=3.5: requested increase in grass height/size. The raw
+  // tuft measured at 0.057m tall; 3.5x brings it to ~0.20m, matching the
+  // meadow-grass height range established earlier in this session
+  // (0.15-0.20m, anchored to the character's real ~1.75m scale). The
+  // "no black space" requirement is handled structurally by the
+  // ground-fill plane inside GrassField.load (see its comments) rather
+  // than by relying on instance count/density alone — that would need
+  // hundreds of extra tuft instances just to close small gaps, at a
+  // real cost of hundreds of thousands of triangles for zero visual
+  // gain over a 2-triangle color-matched plane.
+  try {
+    const grassField = new GrassField(sceneManager.scene);
+    await grassField.load(ASSET_PATHS.grassTuft, {
+      groundY: -0.725,
+      avoidCenter: { x: -0.016, z: -1.483 },
+      avoidRadius: 0.35,
+      baseScale: 3.5,
+    });
+  } catch (err) {
+    console.error('[viewer] grass field failed to load (continuing without it):', err);
+  }
+
+  document.getElementById('loading').style.display = 'none';
+
+  sceneManager.onUpdate((dt) => character.mixer.update(dt));
+
+  console.log('[viewer] starting render loop / exercise scheduler');
+  const animationController = new AnimationController(character);
+  const overlay = new OverlayUI();
+  const scheduler = new ExerciseScheduler(animationController, overlay);
+
+  scheduler.onSessionComplete(() => {
+    if (pyBridge && pyBridge.session_complete) {
+      pyBridge.session_complete();
+    }
+  });
+
+  await scheduler.run();
+}
+
+main().catch((err) => {
+  console.error('[viewer] fatal error:', err);
+  console.error('[viewer] fatal error stack:', err?.stack);
+  document.getElementById('loading').textContent = 'Could not load environment.';
+  // Still tell Python we're "done" so the app doesn't hang on a broken scene.
+  initBridge().then((bridge) => bridge?.session_complete?.());
+});
+  </script>
+</body>
+</html>

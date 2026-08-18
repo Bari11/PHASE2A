@@ -1,0 +1,9 @@
+PyQt5>=5.15.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+mediapipe>=0.10.0
+
+# Voice alerts (no pip install needed):
+# Linux:   sudo apt install espeak
+# macOS:   built-in 'say'
+# Windows: built-in PowerShell SAPI
