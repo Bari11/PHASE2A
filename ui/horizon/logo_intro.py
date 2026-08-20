@@ -375,8 +375,14 @@ class LogoIntro(QWidget):
 
     def _finish(self):
         self._tick_timer.stop()
-        self.hide()
+        # Emit BEFORE hide(): the connected slot (tray_app.py's
+        # _show_calm_screen) runs synchronously here and shows
+        # HorizonMode's fullscreen widget on top of this one. Only
+        # once that's done do we hide ourselves — so the screen is
+        # never left uncovered between the two, which is what was
+        # causing a flash back to the desktop.
         self.finished.emit()
+        self.hide()
 
     def closeEvent(self, event):
         self._tick_timer.stop()

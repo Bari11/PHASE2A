@@ -547,6 +547,16 @@ class StressPostureDetector:
         self._backend = _MPBackend()
         self.session  = SessionData()
 
+        # Optional external tap into the raw camera frames, set only by
+        # Horizon Mode (see ui/horizon/horizon_gaze.py) while its own
+        # gaze/head-pose check needs frames at real camera framerate —
+        # much faster than the UI's 500ms poll cycle allows. None of
+        # the main detection logic reads or depends on this; it's
+        # purely an optional side-channel for a separate component.
+        # Wrapped in try/except at the call site so a bug here can
+        # never take down the main detector thread.
+        self.frame_hook: Optional[Callable[[np.ndarray], None]] = None
+
         # Personal baseline (medians captured during calibration)
         self._baseline: Dict[str, Optional[float]] = {
             'blink_rate': None,
@@ -658,7 +668,17 @@ class StressPostureDetector:
                 time.sleep(0.05); continue
             self._frame_n += 1
             if self._frame_n % 2 == 0:          # ~7 fps effective
-                self._process(cv2.flip(frame, 1))
+                flipped = cv2.flip(frame, 1)
+                self._process(flipped)
+                if self.frame_hook is not None:
+                    try:
+                        self.frame_hook(flipped)
+                    except Exception:
+                        # A problem in Horizon Mode's gaze monitor must
+                        # never be able to take down the main detector
+                        # loop — this component is intentionally
+                        # decoupled from it.
+                        pass
             time.sleep(0.033)
         cap.release()
 

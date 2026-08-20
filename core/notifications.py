@@ -15,7 +15,7 @@ import time
 import random
 import subprocess
 import math
-from typing import List
+from typing import List, Optional
 
 from PyQt5.QtWidgets import QWidget, QApplication
 from PyQt5.QtCore    import Qt, QTimer, QObject, pyqtSignal, pyqtSlot, QRect, QPoint
@@ -71,6 +71,11 @@ MSGS = {
         "Coffee counts as dehydration. Drink WATER!",
         "Your kidneys slid a note: please hydrate.",
         "1% dehydration = 10% less brainpower. Drink up!",
+    ],
+    'horizon': [
+        "Still looking this way? Find something far off instead.",
+        "Eyes still here! Try that distant spot you picked.",
+        "This screen isn't 'far away.' Look past it for a moment.",
     ],
 }
 
@@ -155,6 +160,7 @@ VOICE_TEXT = {
     'appreciation': "Great job! Good posture maintained!",
     'water':        "Break time! Drink some water!",
     'camera':       "Camera blocked. Please uncover your camera.",
+    'horizon':      "Please look away from the screen",
 }
 
 THEMES = {
@@ -183,6 +189,14 @@ THEMES = {
         'border': QColor(80, 160, 255), 'badge_bg': QColor(60, 130, 255, 60),
         'badge': 'HYDRATION TIME',    'text': QColor(190, 220, 255),
     },
+    'horizon': {
+        # Calm indigo/blue-violet, matching Horizon Mode's own dark
+        # night-sky palette rather than any of the existing alert
+        # colors — this should read as "gentle reminder", not "alert".
+        'top': QColor(70, 60, 130),   'bot': QColor(40, 34, 82),
+        'border': QColor(140, 130, 210), 'badge_bg': QColor(120, 110, 200, 60),
+        'badge': 'LOOK AWAY',         'text': QColor(215, 210, 245),
+    },
 }
 
 
@@ -210,7 +224,7 @@ class NotifPopup(QWidget):
     ANIM_MS   = 350    # fade-in / fade-out duration in ms
     HOLD_MS   = 6500   # how long the popup stays fully visible
 
-    def __init__(self, kind: str, msg: str, signals: list = None):
+    def __init__(self, kind: str, msg: str, signals: list = None, persistent: bool = False):
         # ── Window flags: FramelessWindowHint + StaysOnTop ──────────────────
         # Do NOT use Qt.Tool on Windows — it can make the window invisible.
         # Do NOT use WA_TranslucentBackground — breaks DWM compositing.
@@ -225,10 +239,16 @@ class NotifPopup(QWidget):
         self.setFixedSize(self.W, self.H)
         self.setWindowOpacity(0.0)   # start invisible; we fade via setWindowOpacity
 
-        self._alive   = True
-        self._msg     = msg
-        self._theme   = THEMES.get(kind, THEMES['posture'])
-        self._t0      = time.time()
+        self._alive      = True
+        self._msg        = msg
+        self._theme      = THEMES.get(kind, THEMES['posture'])
+        self._t0         = time.time()
+        # persistent=True: skip the automatic hold->out transition below
+        # (used by Horizon Mode's gaze notice, which must stay open for
+        # exactly as long as external state says "looking at screen" —
+        # not a fixed duration). Caller must call begin_dismiss() to
+        # start the close animation.
+        self._persistent = persistent
         # Build subtitle from signal list
         if signals:
             labels = [SIGNAL_LABELS.get(s, s.replace('_', ' ').title()) for s in signals[:2]]
@@ -261,6 +281,18 @@ class NotifPopup(QWidget):
         self.hide()
         self.deleteLater()
 
+    def begin_dismiss(self):
+        """
+        Externally triggered close — used for persistent popups (see
+        __init__) once the caller's state says it's time to hide.
+        Reuses the same slide-out/fade-out animation as a normal
+        timed dismissal, just started on demand instead of after
+        HOLD_MS. Safe to call even mid slide-in.
+        """
+        if self._phase in ('in', 'hold'):
+            self._phase    = 'out'
+            self._phase_ms = 0
+
     def _tick(self):
         self._phase_ms += 16
 
@@ -278,7 +310,7 @@ class NotifPopup(QWidget):
         elif self._phase == 'hold':
             self.move(self._tx, self._ty)
             self.setWindowOpacity(1.0)
-            if self._phase_ms >= self.HOLD_MS:
+            if not self._persistent and self._phase_ms >= self.HOLD_MS:
                 self._phase    = 'out'
                 self._phase_ms = 0
 
@@ -405,6 +437,7 @@ class NotificationOverlay(QObject):
         self.voice_enabled = True
         self.voice_gender  = 'female'
         self._popups: List[NotifPopup] = []
+        self._horizon_popup: Optional[NotifPopup] = None   # persistent, state-driven (see set_horizon_active)
         # Qt.QueuedConnection ensures the slot runs on THIS object's thread (main thread)
         # even when emit() is called from a background thread
         self._do_show.connect(self._create_popup, Qt.QueuedConnection)
@@ -420,6 +453,35 @@ class NotificationOverlay(QObject):
             except Exception:
                 pass
         self._popups.clear()
+        if self._horizon_popup is not None:
+            try:
+                self._horizon_popup._close_safe()
+            except Exception:
+                pass
+            self._horizon_popup = None
+
+    def set_horizon_active(self, looking_at_screen: bool):
+        """
+        Persistent, state-driven notification for Horizon Mode's gaze
+        monitor. Unlike push(), this is NOT a one-shot fire-and-forget
+        alert: it shows immediately the instant `looking_at_screen`
+        becomes True (no cooldown, no delay) and dismisses immediately
+        the instant it becomes False (no fixed HOLD_MS) — it continuously
+        reflects current gaze state rather than firing a timed popup.
+
+        Main-thread only (no queued-signal marshaling like push() does) —
+        callers must invoke this from the Qt main thread. tray_app.py's
+        _poll_detector, which is what calls this, already runs there
+        (it's a QTimer.timeout slot).
+        """
+        if looking_at_screen and self._horizon_popup is None:
+            msg = random.choice(MSGS.get('horizon', ['Alert!']))
+            popup = NotifPopup('horizon', msg, persistent=True)
+            self._horizon_popup = popup
+            popup.show_animated()
+        elif not looking_at_screen and self._horizon_popup is not None:
+            self._horizon_popup.begin_dismiss()
+            self._horizon_popup = None
 
     def push(self, kind: str, signals: list = None):
         """Thread-safe — can be called from any thread.

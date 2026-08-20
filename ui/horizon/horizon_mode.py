@@ -102,6 +102,7 @@ class HorizonMode(QWidget):
         self._done_shown    = False
         self._glow_t        = 0.0
         self._escape_hint_a = 0.0
+        self._space_presses = 0   # resets each start(); 3 needed to exit early (see keyPressEvent)
 
         self._motes: list[FloatMote] = []
 
@@ -118,7 +119,9 @@ class HorizonMode(QWidget):
         screen = QApplication.primaryScreen().geometry()
         self.setGeometry(screen)
         self.show()
-        self.setFocus()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus(Qt.OtherFocusReason)
 
         self._seconds_left   = 20
         self._can_exit       = False
@@ -130,6 +133,7 @@ class HorizonMode(QWidget):
         self._done_shown     = False
         self._glow_t         = 0.0
         self._escape_hint_a  = 0.0
+        self._space_presses  = 0
         self._suggestion     = random.choice(self.SUGGESTIONS)
 
         w, h = self.width(), self.height()
@@ -141,9 +145,14 @@ class HorizonMode(QWidget):
     # ── Keyboard ─────────────────────────────────────────────
 
     def keyPressEvent(self, event: QKeyEvent):
-        if event.key() in (Qt.Key_Space, Qt.Key_Escape, Qt.Key_Return):
-            if self._can_exit:
+        if not self._can_exit:
+            return
+        if event.key() == Qt.Key_Space:
+            self._space_presses += 1
+            if self._space_presses >= 3:
                 self._finish()
+        elif event.key() in (Qt.Key_Escape, Qt.Key_Return):
+            self._finish()
 
     # ── Second tick ───────────────────────────────────────────
 
@@ -274,25 +283,37 @@ class HorizonMode(QWidget):
         p.setFont(font2)
         pulse2 = 0.9 + 0.1 * math.sin(self._glow_t * 0.9)
         p.setPen(QColor(210, 205, 240, int(240 * self._intro_alpha * pulse2)))
+        # Box height increased from 56 to 78px — a 36pt font's real
+        # ascent+descent needs more room than that; descenders on 'g'
+        # and 'y' were being clipped by the bottom edge of the old box.
         p.drawText(
-            QRectF(0, centre_y - 5, w, 56),
+            QRectF(0, centre_y - 10, w, 78),
             Qt.AlignCenter,
             'Find something far away.'
         )
         p.restore()
 
         # ── Suggestion ────────────────────────────────────────
-        p.save()
-        font3 = QFont('Georgia', 15)
-        font3.setItalic(True)
-        p.setFont(font3)
-        p.setPen(QColor(120, 118, 155, int(160 * self._intro_alpha)))
-        p.drawText(
-            QRectF(0, centre_y + 75, w, 34),
-            Qt.AlignCenter,
-            f'Try: {self._suggestion}'
-        )
-        p.restore()
+        # Hidden during the 'done' phase — "Try: a plant" reads as
+        # confusing/redundant once the countdown has already finished,
+        # and its old position directly overlapped the "Done" digit
+        # block below it (see _draw_digit's digit_y — that box started
+        # at only +60 from centre_y, before this line's own box even
+        # began). Simplest correct fix: don't show it once done, and
+        # give it more clearance from the block below for the phases
+        # where it IS shown.
+        if self._phase != 'done':
+            p.save()
+            font3 = QFont('Georgia', 15)
+            font3.setItalic(True)
+            p.setFont(font3)
+            p.setPen(QColor(120, 118, 155, int(160 * self._intro_alpha)))
+            p.drawText(
+                QRectF(0, centre_y + 88, w, 34),
+                Qt.AlignCenter,
+                f'Try: {self._suggestion}'
+            )
+            p.restore()
 
         # ── Countdown digit (shown only at 20, 10, 0) ─────────
         if self._show_digit and self._digit_fade > 0:
@@ -329,7 +350,10 @@ class HorizonMode(QWidget):
                     text: str, alpha: float, centre_y: float):
         """Large centred countdown number with glow."""
         p.save()
-        digit_y = centre_y + 130
+        # Pushed from centre_y+130 to centre_y+205 — the suggestion line
+        # above now ends at centre_y+122 (see _draw_text), so this gives
+        # real clearance instead of the two blocks overlapping.
+        digit_y = centre_y + 205
 
         # Glow halo — sized and centred to comfortably contain both the
         # digit and the "seconds" label beneath it, with real margin

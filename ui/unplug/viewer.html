@@ -234,7 +234,20 @@ class SceneManager {
     // that plane is being hidden below — harmless to leave.
     this.camera = new THREE.PerspectiveCamera(38, this._aspect(), 0.1, 400);
 
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    // antialias was true. Turned off as a diagnostic + likely real fix:
+    // MSAA roughly doubles the framebuffer's GPU memory/bandwidth cost,
+    // and combined with alpha:true (needed below, can't remove that one)
+    // it's one of the more expensive renderer-level settings available —
+    // completely independent of scene content, so it's a free thing to
+    // rule out before touching geometry/instance counts again. Trunk
+    // textures are already confirmed optimized (2048x2048, verified) and
+    // character shadow-casting is already off, so this is the next
+    // cheapest lever, not a wild guess. If corruption still recurs after
+    // this, it points toward this specific GPU's available VRAM being
+    // the real ceiling rather than any one asset — worth checking the
+    // GPU model/VRAM (Task Manager → Performance → GPU, or dxdiag) to
+    // confirm integrated vs dedicated graphics.
+    this.renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
     this.renderer.setClearColor(0x000000, 0); // fully transparent — PNG background layer shows through
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
     this.renderer.setSize(container.clientWidth, container.clientHeight);
@@ -377,7 +390,30 @@ class CharacterLoader {
 
     root.traverse((node) => {
       if (node.isMesh) {
-        node.castShadow = true;
+        // castShadow was true here. Turned off: boy.glb/girl.glb are
+        // SkinnedMesh (7 sub-meshes each, JOINTS_0/WEIGHTS_0 attributes,
+        // 8 animation clips). Three.js compiles a *separate* shadow-depth
+        // shader program for every shadow-casting object, and on
+        // Chromium/ANGLE's D3D11 backend (what QWebEngine uses on
+        // Windows), skinned-mesh shadow-depth programs are a well-known
+        // trigger for "[WebGL] PERFORMANCE WARNING: Attribute 0 is
+        // disabled" firing on effectively every draw call — this is an
+        // ANGLE-level ES2-emulation fallback path, not a bug in this
+        // file's code (see three.js issue #5251 for the same root
+        // category with morph targets; skinned shadow-depth programs hit
+        // the same fallback). With 7 sub-meshes × the shadow pass + the
+        // main color pass, every animation frame produces a burst of
+        // these warnings — that log spam is real per-frame overhead, and
+        // is a strong candidate for the "frequent glitch/stutter" being
+        // reported, independent of the trunk-texture VRAM issue looked
+        // at earlier. Disabling castShadow here removes the shadow-depth
+        // draw entirely for these meshes, which should eliminate this
+        // specific warning. Trade-off: the character no longer casts a
+        // shadow onto the trunk/ground — sun.castShadow (trunk shadow)
+        // is untouched. If the character's own contact shadow is missed
+        // visually, a cheap non-skinned blob-shadow decal under the
+        // trunk would be the next step, rather than re-enabling this.
+        node.castShadow = false;
         node.receiveShadow = false;
         if (node.material) node.material.side = THREE.FrontSide;
       }
@@ -476,12 +512,24 @@ class CharacterLoader {
 //  a fixed number here — check the console for the exact figure.
 // ─────────────────────────────────────────────────────────────────────────
 
-// Placement stays well clear of both ends of the reserved zone: not
-// closer than -0.55 (near the very bottom edge / camera) and not past
-// -3.6 (leaving real margin before the PNG's 68% boundary at -4.82, so
-// no tuft's silhouette can visually intrude on the background image).
-const GRASS_Z_NEAR = -0.55;
-const GRASS_Z_FAR = -3.6;
+// Placement stays clear of both ends of the reserved zone: not past
+// -4.3 (still leaving real margin — 0.52m — before the PNG's 68%
+// boundary at -4.82, so no tuft's silhouette can visually intrude on
+// the background image). Was -3.6 before; that left the far third of
+// the ~38 m² reserved trapezoid uncovered by tufts (only the
+// color-matched ground-fill plane showed there), which read as "empty"
+// even though technically no black ever showed through. Pushing to
+// -4.3 fills that remaining stretch with real tufts while keeping the
+// same safety margin the original -3.6 was protecting.
+//
+// Near edge moved from -0.55 to -0.40 to match this file's own
+// calibration comment above (the reserved trapezoid's actual
+// camera-projected near edge is Z=-0.40) — -0.55 was leaving a real,
+// visible ~0.15m strip of untextured ground-fill color between the
+// true near edge and where tufts started, which read as an empty band
+// right in the foreground closest to the camera in screenshots.
+const GRASS_Z_NEAR = -0.40;
+const GRASS_Z_FAR = -4.3;
 
 // Width-at-depth, linearly interpolated between the two camera-projected
 // calibration points computed earlier: (Z=-0.405, width=5.90m) and
@@ -558,16 +606,20 @@ class GrassField {
     // tighter than the footprint gives slight overlap for a filled
     // look without gaps between grid cells.
     const tuftFootprint = 0.209 * baseScale; // use the larger (depth) dimension
-    // 0.65 multiplier chosen deliberately as a middle ground, not the
-    // densest option tested: 0.85x gave only ~63 tufts (too sparse, per
-    // feedback), but 0.45x would push past 1.4M triangles on top of an
-    // already GPU-strained scene (see trunkseat.glb's texture/vertex
-    // weight, addressed separately). 0.65x lands around ~118 tufts /
-    // ~679k triangles — a real, meaningful density increase, disclosed
-    // plainly rather than silently maxed out. If the corruption glitch
-    // reappears or worsens, this one multiplier is the first thing to
-    // raise back up.
-    const SPACING = tuftFootprint * 0.65;
+    // 0.52 multiplier — a third density step down. The recurring
+    // "glitch" turned out to have a second, likely bigger cause beyond
+    // trunkseat's texture VRAM (see the castShadow comment in
+    // CharacterLoader above): shadow-casting skinned character meshes
+    // triggering ANGLE's "Attribute 0 is disabled" slow path on every
+    // frame, independent of grass instance count. With that fixed and
+    // trunkseat.glb's textures optimized, there's more headroom than
+    // grass triangle count alone was ever the real limit. Still
+    // deliberately staying under ~1.4M triangles from grass, since that
+    // figure was the one directly observed to coincide with the
+    // corruption glitch previously. Combined with GRASS_Z_NEAR/-FAR
+    // above, 0.52x lands around ~240 tufts / ~1.37M triangles — leaving
+    // a real margin below 1.4M, not right at the edge of it.
+    const SPACING = tuftFootprint * 0.52;
 
     const positions = [];
     for (let z = GRASS_Z_NEAR; z >= GRASS_Z_FAR; z -= SPACING) {
@@ -577,9 +629,17 @@ class GrassField {
       for (let c = 0; c < numCols; c++) {
         const baseX = -width / 2 + colSpacing * (c + 0.5);
         // jitter within the cell so it doesn't read as a grid, capped
-        // well inside the cell so neighbors never fully overlap
-        const jitterX = (Math.random() - 0.5) * colSpacing * 0.7;
-        const jitterZ = (Math.random() - 0.5) * SPACING * 0.7;
+        // well inside the cell so neighbors never fully overlap.
+        // 0.7 → 0.5: at 0.7, two adjacent cells' jitter can occasionally
+        // both swing toward the same shared edge, leaving a visibly bare
+        // patch of ground-fill color between them on the far side (the
+        // blotches seen in screenshots, worst in the near/right area
+        // where cells are largest). 0.5 keeps every tuft closer to its
+        // own cell center — still random enough not to read as a rigid
+        // grid, but without the occasional double-gap. Zero added
+        // triangles: same instance count, just less clustering risk.
+        const jitterX = (Math.random() - 0.5) * colSpacing * 0.5;
+        const jitterZ = (Math.random() - 0.5) * SPACING * 0.5;
         const x = baseX + jitterX;
         const z2 = z + jitterZ;
 

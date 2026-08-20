@@ -64,6 +64,9 @@ MAX_HISTORY    = 20
 CAMERA_BLOCKED_TIMEOUT = 8.0   # seconds of no-face before camera-blocked alert
 CAMERA_ALERT_COOLDOWN  = 30.0  # don't spam camera alerts
 
+HORIZON_INTERVAL_MS      = 20 * 60 * 1000  # 20-20-20 rule: every 20 minutes during an active session
+HORIZON_LOOKAWAY_COOLDOWN = 15.0            # seconds between "please look away" nudges while Horizon Mode is active
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Settings
@@ -1264,6 +1267,34 @@ class TrayApp(QObject):
         self._no_detect_since: Optional[float] = None  # first time face went missing
         self._camera_ok = True
 
+        # ── Horizon Mode (20-20-20) state ─────────────────────────────────────
+        # _horizon_active: True for the whole time the calm eye-rest screen is
+        #   up (from the moment HorizonMode.start() fires to its finished
+        #   signal). While True, _poll_detector and _on_alert both suppress
+        #   every OTHER notification kind — only the "please look away" nudge
+        #   is allowed to fire, per the requirement that Horizon Mode shows no
+        #   other alert type while it's active.
+        # _horizon_owns_detector: True only when Horizon Mode itself started
+        #   the detector (i.e. triggered from the tray with no session
+        #   running). In that case we tear the detector back down when
+        #   Horizon Mode finishes, since the user never asked for an ongoing
+        #   monitored session — just a one-off break. If a real session is
+        #   already active, this stays False and stop_session() (not us)
+        #   owns the detector's lifecycle.
+        self._horizon_active        = False
+        self._horizon_owns_detector = False
+        self._horizon_owns_poll_timer = False
+        self._last_horizon_alert_t  = 0.0
+        self._horizon_gaze          = None  # HorizonGazeMonitor, only while the calm screen is up
+
+        # Recurring 20-minute Horizon Mode trigger, per the 20-20-20 rule.
+        # Only runs while a real session is active — started in
+        # start_session(), stopped in stop_session(). Manually triggering
+        # Horizon Mode from the tray (trigger_horizon_mode) is completely
+        # separate and does not start/need this timer.
+        self._horizon_timer = QTimer(self)
+        self._horizon_timer.timeout.connect(self.trigger_horizon_mode)
+
         self._tray_state='idle'
 
         self.dashboard=DashboardWindow(self._settings,tray_ref=self)
@@ -1296,7 +1327,7 @@ class TrayApp(QObject):
         unplug_act=QAction('🔌  Trigger Unplug Mode',self._app)
         unplug_act.triggered.connect(self.trigger_unplug_mode); menu.addAction(unplug_act)
 
-        horizon_act=QAction('👁  Trigger 20:20:20 Mode',self._app)
+        horizon_act=QAction('👁  Trigger Horizon Mode',self._app)
         horizon_act.triggered.connect(self.trigger_horizon_mode); menu.addAction(horizon_act)
 
         menu.addSeparator()
@@ -1365,17 +1396,64 @@ class TrayApp(QObject):
 
     def trigger_horizon_mode(self):
         """
-        Manually trigger Horizon Mode: plays the brief HORIZON logo
-        intro first, then hands off into the calm 20-20-20 eye-rest
-        overlay once the intro settles into stillness.
+        Trigger Horizon Mode: plays the brief HORIZON logo intro first,
+        then hands off into the calm 20-20-20 eye-rest overlay once the
+        intro settles into stillness.
+
+        Works two ways:
+          - Automatically, every 20 minutes while a real session is
+            active (see the _horizon_timer wired up in __init__/
+            start_session/stop_session) — the 20-20-20 rule.
+          - Manually from the tray menu at any time, session or no
+            session. If no session is running, this starts a detector
+            just for the duration of the break (so the "please look
+            away" camera check has something to read from), and tears
+            it back down again afterwards — it does NOT start a real
+            monitored session.
         """
+        if self._horizon_active:
+            return  # already showing; don't stack overlapping triggers
+
         try:
             from ui.horizon.logo_intro import LogoIntro
             from ui.horizon.horizon_mode import HorizonMode
+            from ui.horizon.horizon_gaze import HorizonGazeMonitor
+
+            # If nothing is watching the camera right now, Horizon Mode
+            # needs its own detector for the look-away check — started
+            # here, and it's ours to stop again when the break ends.
+            # _poll_detector (where the look-away check itself lives) only
+            # runs while _poll_timer is active, and that timer is normally
+            # only started by start_session() — so a standalone tray
+            # trigger needs to start it here too, or the check never fires.
+            self._horizon_owns_detector = False
+            self._horizon_owns_poll_timer = False
+            if not self.detector:
+                self.detector = StressPostureDetector(on_alert=self._on_alert)
+                self.detector.start()
+                self._horizon_owns_detector = True
+            if not self._poll_timer.isActive():
+                self._poll_timer.start(500)
+                self._horizon_owns_poll_timer = True
 
             def _show_calm_screen():
+                self._horizon_active = True
+                self._last_horizon_alert_t = 0.0
+
+                # Real gaze/head-pose monitoring, not a crude proxy —
+                # see ui/horizon/horizon_gaze.py. Attached only now
+                # (not any earlier) and only for the lifetime of this
+                # calm screen. Frames arrive via the detector's
+                # frame_hook at real camera framerate (~7fps), not the
+                # slow 500ms UI poll, so the monitor's own 0.75s
+                # debounce is actually meaningful.
+                self._horizon_gaze = HorizonGazeMonitor()
+                if self.detector:
+                    self.detector.frame_hook = self._horizon_gaze.process_frame
+
                 mode = HorizonMode()
                 self._horizon_mode = mode
+                mode.finished.connect(self._on_horizon_finished)
                 mode.start()
 
             intro = LogoIntro()
@@ -1384,13 +1462,46 @@ class TrayApp(QObject):
             intro.start()
         except Exception as e:
             print(f'[Canary] Could not start Horizon Mode: {e}')
+            self._horizon_active = False
+
+    def _on_horizon_finished(self):
+        """Runs once the calm eye-rest screen closes, however it closed."""
+        self._horizon_active = False
+        # If the user exited while the gaze notice was up (they were
+        # still looking at the screen), it must vanish right along with
+        # the calm screen — _poll_detector won't touch it again now that
+        # _horizon_active is False.
+        self.overlay.set_horizon_active(False)
+        if self.detector:
+            self.detector.frame_hook = None
+        if getattr(self, '_horizon_gaze', None) is not None:
+            self._horizon_gaze.close()
+            self._horizon_gaze = None
+        if self._horizon_owns_detector and self.detector:
+            self.detector.stop()
+            self.detector = None
+        if getattr(self, '_horizon_owns_poll_timer', False):
+            self._poll_timer.stop()
+        self._horizon_owns_detector = False
+        self._horizon_owns_poll_timer = False
 
     # ── Session ───────────────────────────────────────────────────────────────
 
     def start_session(self):
-        if self.detector and self.detector._running: return
-        self.detector=StressPostureDetector(on_alert=self._on_alert)
-        self.detector.start()
+        if self.detector and self.detector._running:
+            if self._horizon_owns_detector:
+                # A Horizon Mode break already spun up a detector of its
+                # own (no session was active at the time). The user is
+                # now explicitly starting a real session — adopt that
+                # same detector rather than leaving it to Horizon Mode's
+                # cleanup, which would otherwise stop it out from under
+                # the session the moment the break screen closes.
+                self._horizon_owns_detector = False
+            else:
+                return
+        else:
+            self.detector=StressPostureDetector(on_alert=self._on_alert)
+            self.detector.start()
         self._start_act.setEnabled(False); self._stop_act.setEnabled(True)
         # Reset change-tracking state
         self._prev_posture_alerting = False
@@ -1399,6 +1510,7 @@ class TrayApp(QObject):
         self._camera_ok             = True
         self._last_camera_alert_t   = 0.0
         self._poll_timer.start(500)
+        self._horizon_timer.start(HORIZON_INTERVAL_MS)  # 20-20-20 rule for this session
         self.dashboard.on_session_started(list(self._history))
         self._tray_state='good'; self._icon.setIcon(_make_canary_icon('good'))
         self._icon.showMessage('Canary 🐦 — Session Started',
@@ -1408,6 +1520,7 @@ class TrayApp(QObject):
     def stop_session(self):
         if not self.detector: return
         self._poll_timer.stop()
+        self._horizon_timer.stop()
         detector=self.detector; self.detector=None
         self._start_act.setEnabled(True); self._stop_act.setEnabled(False)
         sd=detector.stop()
@@ -1436,6 +1549,23 @@ class TrayApp(QObject):
         overlay.push() — that would cause double popups.
         """
         if not self.detector:
+            return
+
+        # ── Horizon Mode branch ────────────────────────────────────────────
+        # While the calm eye-rest screen is up, this is ALL _poll_detector
+        # does: check the debounced state from HorizonGazeMonitor (real
+        # eyes-open + gaze-direction + head-pose evaluation, sustained for
+        # TRANSITION_SEC before it's trusted — see horizon_gaze.py) and
+        # continuously reflect it via set_horizon_active(): shows the
+        # instant looking_at_screen goes True, hides the instant it goes
+        # False — no cooldown, no fixed hold duration (see
+        # NotificationOverlay.set_horizon_active in notifications.py).
+        # No camera-blocked alert, no tray icon changes, no posture/stress
+        # tracking — those are exactly the "other notification types" that
+        # should not appear during Horizon Mode.
+        if self._horizon_active:
+            looking_at_screen = bool(self._horizon_gaze and self._horizon_gaze.looking_at_screen)
+            self.overlay.set_horizon_active(looking_at_screen)
             return
 
         live = self.detector.get_live()
@@ -1508,6 +1638,13 @@ class TrayApp(QObject):
         We always show the overlay popup here.  _poll_detector handles the tray
         icon and live-dashboard event log separately (no double-overlay risk).
         """
+        if self._horizon_active:
+            # Horizon Mode shows exactly one notification type — the
+            # look-away nudge fired from _poll_detector — and nothing
+            # else, regardless of what the detector itself picks up
+            # (posture/stress/water/appreciation all suppressed here).
+            return
+
         sigs = signals or []
         now  = time.time()
 
