@@ -1,0 +1,67 @@
+diff --git a/ui/tray_app.py b/ui/tray_app.py
+index b1559aa..b6d5402 100644
+--- a/ui/tray_app.py
++++ b/ui/tray_app.py
+@@ -1295,6 +1295,15 @@ class TrayApp(QObject):
+         self._horizon_timer = QTimer(self)
+         self._horizon_timer.timeout.connect(self.trigger_horizon_mode)
+ 
++        # ── Calm Mode (Phase 1: manual-only) state ────────────────────────────
++        # _calm_active: True for the whole time the breathing screen is up.
++        # Guards against a second tray click opening a duplicate window —
++        # same pattern as _horizon_active above. Calm Mode does not touch
++        # the detector, the poll timer, or session state at all; it's a
++        # pure visual overlay with no automatic trigger in this phase.
++        self._calm_active = False
++        self._calm_mode = None
++
+         self._tray_state='idle'
+ 
+         self.dashboard=DashboardWindow(self._settings,tray_ref=self)
+@@ -1330,6 +1339,9 @@ class TrayApp(QObject):
+         horizon_act=QAction('👁  Trigger Horizon Mode',self._app)
+         horizon_act.triggered.connect(self.trigger_horizon_mode); menu.addAction(horizon_act)
+ 
++        calm_act=QAction('🌊  Calm Mode',self._app)
++        calm_act.triggered.connect(self.trigger_calm_mode); menu.addAction(calm_act)
++
+         menu.addSeparator()
+         quit_act=QAction('✕  Quit Canary',self._app)
+         quit_act.triggered.connect(self._quit); menu.addAction(quit_act)
+@@ -1464,6 +1476,36 @@ class TrayApp(QObject):
+             print(f'[Canary] Could not start Horizon Mode: {e}')
+             self._horizon_active = False
+ 
++    def trigger_calm_mode(self):
++        """
++        Manually trigger Calm Mode: a short ocean-blue breathing
++        particle animation (INHALE/HOLD/EXHALE, a few cycles, ending
++        in a particle smile that fades away).
++
++        Phase 1: manual-only. Works whether or not a session is
++        running, does not touch the detector/camera, and is not yet
++        wired to automatic stress triggering or to Unplug Mode — that
++        comes in a later phase.
++        """
++        if self._calm_active:
++            return  # already showing; don't stack overlapping triggers
++
++        try:
++            from ui.calm.calm_mode import CalmMode
++        except Exception as e:
++            print(f'[Canary] Could not start Calm Mode: {e}')
++            return
++
++        self._calm_active = True
++        mode = CalmMode()
++        self._calm_mode = mode
++        mode.finished.connect(self._on_calm_finished)
++        mode.start()
++
++    def _on_calm_finished(self):
++        self._calm_active = False
++        self._calm_mode = None
++
+     def _on_horizon_finished(self):
+         """Runs once the calm eye-rest screen closes, however it closed."""
+         self._horizon_active = False

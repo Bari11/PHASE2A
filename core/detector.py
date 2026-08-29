@@ -542,10 +542,28 @@ class StressPostureDetector:
     )
     ALL_SIGNALS = STRESS_SIGNALS + POSTURE_SIGNALS
 
-    def __init__(self, on_alert: Optional[Callable[[str, float], None]] = None):
+    def __init__(self, on_alert: Optional[Callable[[str, float], None]] = None,
+                 frame_processing_enabled: bool = True):
         self.on_alert = on_alert
         self._backend = _MPBackend()
         self.session  = SessionData()
+
+        # Added for Unplug Mode's exercise validation (see
+        # ui/unplug/exercise_validation_coordinator.py). When a caller
+        # only wants camera frames via frame_hook and has no use for
+        # the stress/posture analysis itself (e.g. a temporary detector
+        # opened solely to drive Unplug Mode's camera preview + CV
+        # validation, with no monitoring session active), this skips
+        # self._process() entirely in _loop() below — that call is a
+        # full MediaPipe inference pass, and running it for no reason
+        # was real, avoidable per-frame cost stacking on top of
+        # whatever the caller's own frame_hook does, which is what
+        # made the camera feed lag. Defaults to True, so every existing
+        # caller (Calm Mode, Horizon Mode's shared detector, the main
+        # dashboard) behaves exactly as before — this is opt-out, not
+        # opt-in, and nothing changes unless a caller explicitly passes
+        # False.
+        self.frame_processing_enabled = frame_processing_enabled
 
         # Optional external tap into the raw camera frames, set only by
         # Horizon Mode (see ui/horizon/horizon_gaze.py) while its own
@@ -669,7 +687,8 @@ class StressPostureDetector:
             self._frame_n += 1
             if self._frame_n % 2 == 0:          # ~7 fps effective
                 flipped = cv2.flip(frame, 1)
-                self._process(flipped)
+                if self.frame_processing_enabled:
+                    self._process(flipped)
                 if self.frame_hook is not None:
                     try:
                         self.frame_hook(flipped)

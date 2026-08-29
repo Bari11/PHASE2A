@@ -1295,6 +1295,15 @@ class TrayApp(QObject):
         self._horizon_timer = QTimer(self)
         self._horizon_timer.timeout.connect(self.trigger_horizon_mode)
 
+        # ── Calm Mode (Phase 1: manual-only) state ────────────────────────────
+        # _calm_active: True for the whole time the breathing screen is up.
+        # Guards against a second tray click opening a duplicate window —
+        # same pattern as _horizon_active above. Calm Mode does not touch
+        # the detector, the poll timer, or session state at all; it's a
+        # pure visual overlay with no automatic trigger in this phase.
+        self._calm_active = False
+        self._calm_mode = None
+
         self._tray_state='idle'
 
         self.dashboard=DashboardWindow(self._settings,tray_ref=self)
@@ -1330,6 +1339,9 @@ class TrayApp(QObject):
         horizon_act=QAction('👁  Trigger Horizon Mode',self._app)
         horizon_act.triggered.connect(self.trigger_horizon_mode); menu.addAction(horizon_act)
 
+        calm_act=QAction('🌊  Calm Mode',self._app)
+        calm_act.triggered.connect(self.trigger_calm_mode); menu.addAction(calm_act)
+
         menu.addSeparator()
         quit_act=QAction('✕  Quit Canary',self._app)
         quit_act.triggered.connect(self._quit); menu.addAction(quit_act)
@@ -1361,6 +1373,33 @@ class TrayApp(QObject):
         """
         Manually trigger Unplug Mode: Opening Animation -> 3D wellness
         environment (the 7-exercise sequence) -> Closing Animation.
+
+        Each handoff below shows the NEXT full-screen window (already
+        raised on top) BEFORE dismissing the current one, rather than
+        the other way around. Both windows involved at each handoff are
+        full-screen and solid black/opaque, so as long as the new one
+        is on top first, hiding the old one afterwards can only reveal
+        the new one underneath — never the desktop. Previously each
+        stage hid itself immediately before signalling "done", which
+        left a real gap (however brief) where the desktop showed
+        through while the next stage was still being constructed —
+        worse the longer that setup took (e.g. ExerciseEnvironment's
+        camera/coordinator startup). See OpeningAnimation.dismiss() /
+        ExerciseEnvironment.dismiss() for the same reasoning at the
+        single-widget level.
+
+        show()/raise_() alone only SCHEDULE a paint — they don't force
+        one to actually happen before the next line of code runs, so
+        even with the ordering above, the old window's dismiss() could
+        still execute before the new window's first frame has really
+        been composited (a real, if usually brief, source of exactly
+        the flash this ordering is meant to prevent). processEvents()
+        forces Qt to flush that pending paint synchronously, and the
+        small 60ms delay before dismiss() gives the OS-level compositor
+        a little real wall-clock time on top of that for Chromium's own
+        (separate-process) compositor in ExerciseEnvironment's
+        QWebEngineView specifically, which processEvents() alone can't
+        force to sync.
         """
         try:
             from ui.unplug.opening_animation import OpeningAnimation
@@ -1372,20 +1411,33 @@ class TrayApp(QObject):
             def _on_closing_done():
                 # Main interface is already what's underneath — nothing
                 # further to do once the closing animation's black
-                # screen fades away.
+                # screen fades away. This is the one stage in the chain
+                # where revealing the desktop IS the correct final
+                # result, so ClosingAnimation hides itself as before.
                 pass
 
             def _on_exercises_done():
                 closing = ClosingAnimation()
                 self._unplug_closing = closing
                 closing.animation_done.connect(_on_closing_done)
-                closing.start()
+                closing.start()                       # shown + raised on top first...
+                QApplication.processEvents()          # ...force that paint to actually flush...
+                QTimer.singleShot(60, self._unplug_environment.dismiss)  # ...then hide the environment
 
             def _on_opening_done():
-                env = ExerciseEnvironment(character=character)
+                # Share the already-running detector (if any) so Unplug
+                # Mode's camera-based exercise validation reuses the
+                # SAME camera device rather than opening a second one —
+                # same pattern trigger_horizon_mode uses below. If no
+                # monitoring session is active, ExerciseEnvironment's
+                # coordinator creates and owns a temporary detector for
+                # just this Unplug session.
+                env = ExerciseEnvironment(character=character, shared_detector=self.detector)
                 self._unplug_environment = env
                 env.animation_done.connect(_on_exercises_done)
-                env.start()
+                env.start()                           # shown + raised on top first...
+                QApplication.processEvents()          # ...force that paint to actually flush...
+                QTimer.singleShot(5, self._unplug_anim.dismiss)   # ...then hide the opening animation
 
             anim = OpeningAnimation()
             self._unplug_anim = anim
@@ -1463,6 +1515,36 @@ class TrayApp(QObject):
         except Exception as e:
             print(f'[Canary] Could not start Horizon Mode: {e}')
             self._horizon_active = False
+
+    def trigger_calm_mode(self):
+        """
+        Manually trigger Calm Mode: a short ocean-blue breathing
+        particle animation (INHALE/HOLD/EXHALE, a few cycles, ending
+        in a particle smile that fades away).
+
+        Phase 1: manual-only. Works whether or not a session is
+        running, does not touch the detector/camera, and is not yet
+        wired to automatic stress triggering or to Unplug Mode — that
+        comes in a later phase.
+        """
+        if self._calm_active:
+            return  # already showing; don't stack overlapping triggers
+
+        try:
+            from ui.calm.calm_mode import CalmMode
+        except Exception as e:
+            print(f'[Canary] Could not start Calm Mode: {e}')
+            return
+
+        self._calm_active = True
+        mode = CalmMode()
+        self._calm_mode = mode
+        mode.finished.connect(self._on_calm_finished)
+        mode.start()
+
+    def _on_calm_finished(self):
+        self._calm_active = False
+        self._calm_mode = None
 
     def _on_horizon_finished(self):
         """Runs once the calm eye-rest screen closes, however it closed."""

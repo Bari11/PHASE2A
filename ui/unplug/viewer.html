@@ -32,7 +32,20 @@
     background-repeat: no-repeat;
     z-index: 0;
   }
-  #canvas-container { width: 100%; height: 100%; position: relative; z-index: 1; }
+  #canvas-container {
+    width: 100%; height: 100%; position: relative; z-index: 1;
+    /* Hidden until every environment piece (trunk seat, character,
+       grass) has finished loading, then revealed together in one
+       fade — see main()'s Promise.all below. Prevents the previous
+       "pop in one at a time" sequence (trunk appears, then a beat
+       later the character appears, then a beat later grass appears)
+       since the container itself is invisible for that whole window
+       regardless of the order the individual pieces actually finish
+       loading in underneath it. */
+    opacity: 0;
+    transition: opacity 0.5s ease;
+  }
+  #canvas-container.ready { opacity: 1; }
   canvas { display: block; width: 100% !important; height: 100% !important; }
 
   /* ── Overlay UI — flat DOM text over the canvas, not 3D text.
@@ -74,6 +87,102 @@
   }
   .dot.filled { background: rgba(230,220,255,0.9); transform: scale(1.15); }
 
+  #progress-count {
+    margin-top: 6px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    color: rgba(242,240,248,0.75);
+    opacity: 0;
+    transition: opacity 0.35s ease;
+  }
+  #progress-count.visible { opacity: 1; }
+
+  /* Character badge — small, unobtrusive, top-left. Shows which
+     figure is demonstrating without competing with the 3D scene. */
+  #character-badge {
+    position: absolute;
+    top: 4%;
+    left: 4%;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    font-size: 13px;
+    letter-spacing: 0.05em;
+    color: rgba(242,240,248,0.85);
+    background: rgba(30,20,50,0.32);
+    border: 1px solid rgba(180,150,255,0.35);
+    border-radius: 20px;
+    padding: 5px 14px;
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  /* Transient feedback line ("Great job!", "Try again", ...). Shown
+     just under the exercise name — never stacked/spammed, only ever
+     one line visible at a time, each replacing the last. */
+  #feedback-text {
+    margin-top: 8px;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    min-height: 22px;
+    opacity: 0;
+    transform: translateY(-4px);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+  }
+  #feedback-text.visible { opacity: 1; transform: translateY(0); }
+  #feedback-text.positive { color: #bff2c8; }
+  #feedback-text.neutral  { color: #f2e6b8; }
+  #feedback-text.negative { color: #f2c8c8; }
+
+  /* Live camera preview — right of the 3D character, small, glowing
+     border matching Canary's purple accent (same tone already used
+     for the overlay text-shadow above). Deliberately modest in size
+     so the 3D character stays the visual focus. */
+  #camera-preview-wrap {
+    position: absolute;
+    top: 22%;
+    right: 4%;
+    width: 168px;
+    height: 126px;
+    border-radius: 14px;
+    overflow: hidden;
+    background: rgba(20,14,34,0.55);
+    border: 1.5px solid rgba(190,160,255,0.55);
+    box-shadow: 0 0 14px 2px rgba(150,110,230,0.35),
+                0 0 2px 1px rgba(220,200,255,0.4) inset;
+    opacity: 0;
+    transition: opacity 0.4s ease, box-shadow 0.25s ease;
+    z-index: 2;
+  }
+  #camera-preview-wrap.visible { opacity: 1; }
+  #camera-preview-wrap.state-correct  { box-shadow: 0 0 16px 3px rgba(120,220,150,0.55); }
+  #camera-preview-wrap.state-retry    { box-shadow: 0 0 16px 3px rgba(230,190,110,0.5); }
+  #camera-preview {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    display: block;
+    /* Mirror already applied server-side (frame_hook flips the frame),
+       so no additional CSS mirroring needed here. */
+  }
+  #camera-preview-label {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 8px;
+    font-family: 'Segoe UI', Arial, sans-serif;
+    font-size: 11px;
+    color: rgba(230,225,245,0.8);
+  }
+  /* .waiting covers BOTH "still starting up" and "genuinely
+     unavailable" — either way there's no live frame to show yet, so
+     the label takes over instead of an empty/stale video element.
+     setCameraStatus() below sets the label's actual text per state —
+     this box is never blank with no explanation, at any point. */
+  #camera-preview-wrap.waiting #camera-preview-label { display: flex; }
+  #camera-preview-wrap.waiting #camera-preview { visibility: hidden; }
+
   #loading {
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
@@ -87,9 +196,16 @@
 <body>
   <div id="bg-layer"></div>
   <div id="canvas-container"></div>
+  <div id="character-badge"></div>
   <div id="overlay">
     <div id="exercise-name"></div>
+    <div id="feedback-text"></div>
     <div id="progress-dots"></div>
+    <div id="progress-count"></div>
+  </div>
+  <div id="camera-preview-wrap">
+    <img id="camera-preview" alt="Camera preview" />
+    <div id="camera-preview-label">Starting camera…</div>
   </div>
   <div id="loading">Loading environment…</div>
 
@@ -176,20 +292,57 @@ function downscaleTexture(texture, maxSize = 1024) {
 // present on the loaded character (see resolveClipName), so small
 // naming inconsistencies between the two GLBs (e.g. "Idle_Pose_Girl"
 // vs "Idle_Pose_Boy") don't break anything.
+// cvValidated: true for the 5 exercises core/exercise_pose_monitor.py
+// can actually check (head pose / gaze / wrist-vs-shoulder geometry).
+// leg_raise and heel_raise are deliberately false — lower-body motion
+// isn't reliably readable from a webcam framed on the upper body/face,
+// so these always use the timed progression below, never a faked CV
+// verdict. See that module's docstring for the full reasoning.
 const EXERCISES = [
-  { id: 'head_tilt',     label: 'Head Tilt',     clip: 'head_tilt',     duration: 5.333 },
-  { id: 'head_nod',      label: 'Head Nod',      clip: 'head_nod',      duration: 5.333 },
-  { id: 'head_rotation', label: 'Head Rotation', clip: 'head_rotation', duration: 4.000 },
-  { id: 'head_look',     label: 'Head Look',     clip: 'head_look',     duration: 5.333 },
-  { id: 'arm_raise',     label: 'Arm Raise',     clip: 'arm_raise',     duration: 5.333 },
-  { id: 'leg_raise',     label: 'Leg Raise',     clip: 'leg_raise',     duration: 4.000 },
-  { id: 'heel_raise',    label: 'Heel Raise',    clip: 'heel_raise',    duration: 4.000 },
+  { id: 'head_tilt',     label: 'Head Tilt',     clip: 'head_tilt',     duration: 5.333, cvValidated: true  },
+  { id: 'head_nod',      label: 'Head Nod',      clip: 'head_nod',      duration: 5.333, cvValidated: true  },
+  { id: 'head_rotation', label: 'Head Rotation', clip: 'head_rotation', duration: 4.000, cvValidated: true  },
+  { id: 'head_look',     label: 'Head Look',     clip: 'head_look',     duration: 5.333, cvValidated: true  },
+  { id: 'arm_raise',     label: 'Arm Raise',     clip: 'arm_raise',     duration: 5.333, cvValidated: true  },
+  { id: 'leg_raise',     label: 'Leg Raise',     clip: 'leg_raise',     duration: 4.000, cvValidated: false },
+  { id: 'heel_raise',    label: 'Heel Raise',    clip: 'heel_raise',    duration: 4.000, cvValidated: false },
 ];
 const IDLE_CLIP = 'idle';
 const IDLE_DURATION = 1.333;   // real length of the authored idle loop clip
-const IDLE_BETWEEN_LOOPS = 2;  // ~2.7s — a clearly visible settle, and a clean
-                                // multiple of the loop so it doesn't cut off mid-pose
-const IDLE_FINAL_LOOPS = 3;    // ~4.0s — noticeably longer, calmer close
+const IDLE_BETWEEN_LOOPS = 1;  // ~1.3s settle between exercises
+const IDLE_FINAL_LOOPS = 1;    // ~1.3s closing beat
+// NOTE ON TOTAL SESSION LENGTH: the 7 authored exercise clips alone
+// already total ~33.3s (5.333*4 + 4.000*3) before any idle time is
+// added. A full ~30-32s experience including intro/idle/outro is not
+// achievable without shortening an authored animation clip, which
+// this pass deliberately does NOT do (per "preserve all existing
+// Unplug Mode functionality"/"don't disturb the current code"). Idle
+// gaps above were trimmed to the minimum that still reads as a clear
+// beat (from 2-3 loops down to 1), bringing the NOMINAL happy-path
+// total to ~35-36s — as close to the 30-32s target as possible without
+// touching clip content. Separately and on top of that nominal figure,
+// CV-validated exercises can run longer when a user needs a few tries
+// (bounded by AttemptTracker.HARD_TIMEOUT_SEC per exercise, in
+// core/exercise_pose_monitor.py) — that variability is inherent to
+// real-time validation, not a bug, and is exactly why the safety-net
+// timer in exercise_environment.py was widened rather than left as-is.
+const PROGRESS_LABEL_FORMAT = (i, total) => `${i} / ${total}`;
+
+// Which CSS class + text tone to use for a feedback line, based on its
+// validation status. Kept as one small lookup rather than scattering
+// the mapping across call sites.
+const FEEDBACK_TONE = {
+  correct:         'positive',
+  proceed_timeout: 'neutral',
+  pending:         'neutral',
+};
+
+// Feedback shown for the two timed-only exercises once their animation
+// finishes — never implies CV checked anything, just a friendly close.
+// Deliberately NOT "Great job!" — that phrase is reserved for an actual
+// CV-confirmed correct pose (see core/exercise_pose_monitor.py) so it
+// always means the same specific thing everywhere in the app.
+const TIMED_COMPLETION_FEEDBACK = ['Well done!', "You've got it!"];
 
 const ASSET_PATHS = {
   trunkseat:   '../../assets/environment/trunkseat.glb',
@@ -528,7 +681,23 @@ class CharacterLoader {
 // visible ~0.15m strip of untextured ground-fill color between the
 // true near edge and where tufts started, which read as an empty band
 // right in the foreground closest to the camera in screenshots.
-const GRASS_Z_NEAR = -0.40;
+//
+// -0.40 -> -0.34: a follow-up screenshot (character sitting, full
+// frame) still showed that closest foreground band — between the
+// camera and where tufts start — reading flatter/emptier than the
+// area further back, since only the flat ground-fill plane covers it
+// there (the fill plane already reaches z=+0.45, well past this bound
+// — see addGroundFillPlane's 5.5-deep plane centered at z=-2.3 — so
+// there's no black gap, just less visible tuft texture in that band).
+// Deliberately a SMALL step (0.06m, roughly half a row / ~40-46K
+// triangles) rather than a larger one: this adds to the same ~1.37M
+// triangle baseline that SPACING's own comment documents as already
+// sitting close to a previously-observed real corruption threshold
+// (~1.4M), and this can't be verified against actual GPU behavior
+// without testing on the target machine. If the near band still reads
+// as empty after this, the next step needs to be checked on real
+// hardware before pushing further, not guessed at again blind.
+const GRASS_Z_NEAR = -0.34;
 const GRASS_Z_FAR = -4.3;
 
 // Width-at-depth, linearly interpolated between the two camera-projected
@@ -536,9 +705,16 @@ const GRASS_Z_FAR = -4.3;
 // (Z=-4.821, width=11.25m). Width genuinely grows with distance for a
 // fixed FOV — confirmed earlier, not a bug — so this taper is real, not
 // approximated.
+// Width-at-depth, linearly interpolated between two camera-projected
+// calibration points. Widened from the original calibration (5.90/11.25)
+// to 7.0/12.9 to reach the far-left/far-right ground that was showing as
+// flat/empty in marked screenshots — those areas sat entirely outside
+// the old width bounds, so no amount of density inside the old bounds
+// could ever have reached them. See SPACING below for how the extra
+// area this covers is paid for.
 function grassWidthAtDepth(z) {
-  const zNearCal = -0.405, wNearCal = 5.90;
-  const zFarCal = -4.821, wFarCal = 11.25;
+  const zNearCal = -0.405, wNearCal = 7.0;
+  const zFarCal = -4.821, wFarCal = 12.9;
   const t = (z - zNearCal) / (zFarCal - zNearCal);
   return wNearCal + (wFarCal - wNearCal) * t;
 }
@@ -606,6 +782,25 @@ class GrassField {
     // tighter than the footprint gives slight overlap for a filled
     // look without gaps between grid cells.
     const tuftFootprint = 0.209 * baseScale; // use the larger (depth) dimension
+    // 0.52 -> 0.55: the width bounds above were widened to reach the
+    // marked far-left/far-right empty ground, which adds real area to
+    // cover. Rather than covering that NEW area at the same density AND
+    // keeping the old area exactly as dense (which would meaningfully
+    // increase total triangle count), this small density step down
+    // redistributes roughly the SAME total triangle budget over the
+    // now-larger area — slightly less tight packing in the
+    // already-covered core, in exchange for actually reaching ground
+    // that previously had zero coverage at all. Net effect computed
+    // directly (not estimated): ~235 tufts / ~1.35M triangles — close
+    // to the ~1.37M figure below (previously the safe baseline), not
+    // meaningfully above it, while covering visibly more ground.
+    //
+    // Deliberately NOT going back to the original 0.52 alongside the
+    // wider bounds: that combination lands north of 1.5M triangles,
+    // clearly past the ~1.4M figure that coincided with a real,
+    // previously-observed corruption glitch — see the note below for
+    // why that number matters, and why this stays under it.
+    //
     // 0.52 multiplier — a third density step down. The recurring
     // "glitch" turned out to have a second, likely bigger cause beyond
     // trunkseat's texture VRAM (see the castShadow comment in
@@ -619,7 +814,7 @@ class GrassField {
     // corruption glitch previously. Combined with GRASS_Z_NEAR/-FAR
     // above, 0.52x lands around ~240 tufts / ~1.37M triangles — leaving
     // a real margin below 1.4M, not right at the edge of it.
-    const SPACING = tuftFootprint * 0.52;
+    const SPACING = tuftFootprint * 0.55;
 
     const positions = [];
     for (let z = GRASS_Z_NEAR; z >= GRASS_Z_FAR; z -= SPACING) {
@@ -732,21 +927,98 @@ class AnimationController {
 
 // ─────────────────────────────────────────────────────────────────────────
 //  CompletionStrategy — how the scheduler decides an exercise is "done".
-//  TimerCompletionStrategy is the only one implemented today. A future
-//  PoseValidationStrategy would implement the exact same
-//  awaitCompletion(context) interface (poll MediaPipe landmarks each
-//  frame, resolve once the pose is confirmed, with a max-wait timeout
-//  fallback) — ExerciseScheduler's control flow below does not change
-//  at all when that swap happens; only which strategy object a given
-//  exercise is configured with changes.
+//
+//  TimerCompletionStrategy: the animation itself is the timer (used for
+//  leg_raise/heel_raise, which are never CV-validated — see EXERCISES
+//  above).
+//
+//  PoseValidationStrategy: waits on Python's CV verdict, delivered over
+//  the QWebChannel bridge (see _Bridge in exercise_environment.py).
+//  Both implement the same awaitCompletion(context) interface, so
+//  ExerciseScheduler's control flow doesn't care which one a given
+//  exercise uses.
 // ─────────────────────────────────────────────────────────────────────────
 
 class TimerCompletionStrategy {
-  // context: { animationController, exercise }
+  // context: { animationController, exercise, animationPromise }
   async awaitCompletion(context) {
     // The animation itself IS the timer — we just wait for its natural
     // LoopOnce "finished" event, already awaited by play() below.
-    return context.animationPromise;
+    await context.animationPromise;
+    return { status: 'completed_timed', feedback: null, attempts: 0 };
+  }
+}
+
+// JS-side-only safety net for PoseValidationStrategy: must exceed
+// Python's AttemptTracker.HARD_TIMEOUT_SEC (core/exercise_pose_monitor.py,
+// currently 11s) with real margin, so Python's own timeout/retry logic
+// is always the one actually governing behavior — this only guards
+// against a bridge message getting lost entirely (no pyBridge, a
+// dropped signal, etc.), never fires in normal operation.
+const JS_VALIDATION_SAFETY_MS = 15_000;
+
+// Sole "who's currently waiting on a validation_update" slot. Only one
+// exercise is ever active at a time, so a single module-level handler
+// is enough — set by PoseValidationStrategy.awaitCompletion, read by
+// the bridge.validation_update listener wired in main() below.
+let _activeValidationHandler = null;
+
+class PoseValidationStrategy {
+  constructor(pyBridge, overlay) {
+    this.pyBridge = pyBridge;
+    this.overlay = overlay;
+  }
+
+  // context: { animationController, exercise, animationPromise }
+  async awaitCompletion(context) {
+    const { exercise } = context;
+
+    if (!this.pyBridge || typeof this.pyBridge.start_exercise_validation !== 'function') {
+      // No Python bridge (e.g. viewer.html opened directly in a plain
+      // browser for visual QA) — fall back to the timed behavior
+      // rather than waiting forever for a verdict that can never
+      // arrive. Clearly marked in the log as a fallback, not a silent
+      // "correct".
+      console.warn('[PoseValidationStrategy] no bridge available — timed fallback for', exercise.id);
+      await context.animationPromise;
+      return { status: 'proceed_timeout', feedback: null, attempts: 0 };
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let lastFeedback = null;
+      let attempts = 0;
+
+      const finish = (status) => {
+        if (settled) return;
+        settled = true;
+        _activeValidationHandler = null;
+        clearTimeout(safetyTimer);
+        try { this.pyBridge.stop_exercise_validation(); } catch (e) { /* best-effort */ }
+        resolve({ status, feedback: lastFeedback, attempts });
+      };
+
+      _activeValidationHandler = (exerciseId, status, feedback) => {
+        if (exerciseId !== exercise.id || settled) return;
+        if (feedback) {
+          lastFeedback = feedback;
+          this.overlay.showFeedback(feedback, FEEDBACK_TONE[status] || 'neutral');
+        }
+        this.overlay.setValidationState(status);
+        if (status !== 'pending') attempts += 1;
+        if (status === 'correct' || status === 'proceed_timeout') {
+          finish(status);
+        }
+      };
+
+      try {
+        this.pyBridge.start_exercise_validation(exercise.id);
+      } catch (err) {
+        console.error('[PoseValidationStrategy] start_exercise_validation failed:', err);
+      }
+
+      const safetyTimer = setTimeout(() => finish('proceed_timeout'), JS_VALIDATION_SAFETY_MS);
+    });
   }
 }
 
@@ -757,14 +1029,38 @@ class TimerCompletionStrategy {
 // ─────────────────────────────────────────────────────────────────────────
 
 class ExerciseScheduler {
-  constructor(animationController, overlayUI, exercises = EXERCISES) {
+  constructor(animationController, overlayUI, pyBridge, exercises = EXERCISES) {
     this.anim = animationController;
     this.overlay = overlayUI;
+    this.pyBridge = pyBridge;
     this.exercises = exercises;
     this._onCompleteCallbacks = [];
+    // completedCount: how many exercises have had their turn (any
+    // outcome — correct, timed out, or timed-completion). Used to gate
+    // the spacebar-x3 early-exit feature below, which only arms once
+    // at least 4 exercises are done.
+    this.completedCount = 0;
+    this._earlyExitRequested = false;
+    this._earlyExitResolve = null;
+    this._earlyExitPromise = new Promise((resolve) => { this._earlyExitResolve = resolve; });
   }
 
   onSessionComplete(fn) { this._onCompleteCallbacks.push(fn); }
+
+  // Called from the spacebar-x3 keydown handler in main(). Safe to call
+  // more than once — only the first call has any effect. Whatever
+  // exercise/idle is currently in-flight is raced against this via
+  // Promise.race at both await points in run() below, so the routine
+  // stops promptly rather than waiting out the rest of a long CV
+  // retry/timeout window.
+  triggerEarlyExit() {
+    if (this._earlyExitRequested) return;
+    this._earlyExitRequested = true;
+    if (this.pyBridge && typeof this.pyBridge.stop_exercise_validation === 'function') {
+      try { this.pyBridge.stop_exercise_validation(); } catch (err) { /* best-effort */ }
+    }
+    this._earlyExitResolve();
+  }
 
   async run() {
     this.overlay.setTotal(this.exercises.length);
@@ -772,20 +1068,60 @@ class ExerciseScheduler {
     console.log('[scheduler] START IDLE (intro)');
     await this.anim.play('idle', { loop: THREE.LoopRepeat, holdMs: IDLE_DURATION * 1000 });
 
-    for (let i = 0; i < this.exercises.length; i++) {
+    for (let i = 0; i < this.exercises.length && !this._earlyExitRequested; i++) {
       const exercise = this.exercises[i];
-      const strategy = exercise.completionStrategy ?? new TimerCompletionStrategy();
       const isLast = i === this.exercises.length - 1;
       const loops = isLast ? IDLE_FINAL_LOOPS : IDLE_BETWEEN_LOOPS;
+      const exerciseStartedAt = performance.now();
+      let attemptResult = { status: 'error', feedback: null, attempts: 0 };
 
       try {
-        console.log('[scheduler] START EXERCISE:', exercise.id);
-        this.overlay.showExercise(exercise.label, i + 1);
+        console.log('[scheduler] START EXERCISE:', exercise.id, 'cvValidated:', exercise.cvValidated);
+        this.overlay.showExercise(exercise.label, i + 1, this.exercises.length);
 
-        const animationPromise = this.anim.play(exercise.id, { loop: THREE.LoopOnce });
-        await strategy.awaitCompletion({ animationController: this.anim, exercise, animationPromise });
+        let completionPromise;
+        if (exercise.cvValidated) {
+          // LoopRepeat, not LoopOnce: the character keeps demonstrating
+          // the motion for as long as the user is attempting/retrying
+          // it, instead of finishing the demo long before validation
+          // could plausibly complete.
+          const animationPromise = this.anim.play(exercise.id, {
+            loop: THREE.LoopRepeat,
+            holdMs: JS_VALIDATION_SAFETY_MS,
+          });
+          const strategy = new PoseValidationStrategy(this.pyBridge, this.overlay);
+          completionPromise = strategy.awaitCompletion({ animationController: this.anim, exercise, animationPromise });
+        } else {
+          const animationPromise = this.anim.play(exercise.id, { loop: THREE.LoopOnce });
+          completionPromise = new TimerCompletionStrategy().awaitCompletion(
+            { animationController: this.anim, exercise, animationPromise });
+        }
 
-        console.log('[scheduler] END EXERCISE:', exercise.id);
+        // Race against the early-exit signal so a spacebar-x3 exit
+        // takes effect promptly instead of waiting out however long
+        // is left on the current exercise (which for a CV exercise
+        // could be up to HARD_TIMEOUT_SEC — see core/exercise_pose_monitor.py).
+        const EARLY_EXIT = Symbol('early-exit');
+        const raced = await Promise.race([
+          completionPromise,
+          this._earlyExitPromise.then(() => EARLY_EXIT),
+        ]);
+
+        if (raced === EARLY_EXIT) {
+          console.log('[scheduler] early exit requested mid-exercise:', exercise.id);
+          attemptResult = { status: 'early_exit', feedback: null, attempts: 0 };
+        } else {
+          attemptResult = raced;
+          if (!exercise.cvValidated) {
+            // Not CV-validated — this is an honest "it played, here's an
+            // encouraging line", never a claim that a pose was checked.
+            const fb = TIMED_COMPLETION_FEEDBACK[i % TIMED_COMPLETION_FEEDBACK.length];
+            attemptResult.feedback = fb;
+            this.overlay.showFeedback(fb, 'positive');
+          }
+        }
+
+        console.log('[scheduler] END EXERCISE:', exercise.id, attemptResult);
       } catch (err) {
         // Previously an error here would propagate out of run(), skip
         // every remaining exercise, and land in main()'s catch — which
@@ -795,11 +1131,25 @@ class ExerciseScheduler {
         console.error('[scheduler] EXERCISE FAILED:', exercise.id, err);
       }
 
+      const durationSec = (performance.now() - exerciseStartedAt) / 1000;
+      this._logAttempt(exercise, attemptResult, durationSec);
+      this.completedCount += 1;
+
       this.overlay.hideExercise();
+      this.overlay.setValidationState(null);
+
+      if (this._earlyExitRequested) break;   // skip remaining idle + exercises entirely
 
       try {
         console.log('[scheduler] START IDLE', isLast ? '(final)' : '(between exercises)');
-        await this.anim.play('idle', { loop: THREE.LoopRepeat, holdMs: IDLE_DURATION * 1000 * loops });
+        const EARLY_EXIT = Symbol('early-exit');
+        const raced = await Promise.race([
+          this.anim.play('idle', { loop: THREE.LoopRepeat, holdMs: IDLE_DURATION * 1000 * loops }),
+          this._earlyExitPromise.then(() => EARLY_EXIT),
+        ]);
+        if (raced === EARLY_EXIT) {
+          console.log('[scheduler] early exit requested during idle transition');
+        }
       } catch (err) {
         // Same failure mode, different location: this idle transition
         // used to be unguarded. A crash here (e.g. a dropped WebGL frame
@@ -812,8 +1162,29 @@ class ExerciseScheduler {
       }
     }
 
-    console.log('[scheduler] session complete');
+    if (this._earlyExitRequested) {
+      console.log('[scheduler] session ended early via spacebar-x3 —', this.completedCount, 'of', this.exercises.length, 'exercises completed');
+    } else {
+      console.log('[scheduler] session complete');
+    }
     for (const cb of this._onCompleteCallbacks) cb();
+  }
+
+  _logAttempt(exercise, result, durationSec) {
+    if (!this.pyBridge || typeof this.pyBridge.log_attempt !== 'function') return;
+    try {
+      this.pyBridge.log_attempt(JSON.stringify({
+        exercise: exercise.id,
+        label: exercise.label,
+        cvValidated: !!exercise.cvValidated,
+        result: result.status,
+        durationSec,
+        feedback: result.feedback || '',
+        attempts: result.attempts || 0,
+      }));
+    } catch (err) {
+      console.error('[scheduler] log_attempt failed (continuing):', err);
+    }
   }
 }
 
@@ -823,11 +1194,25 @@ class ExerciseScheduler {
 //  state it's handed.
 // ─────────────────────────────────────────────────────────────────────────
 
+// Minimum time a feedback line stays visible before another can replace
+// it — mirrors the Python-side FEEDBACK_MIN_INTERVAL_SEC "don't spam"
+// requirement on the display side too, independent of how often
+// Python actually sends updates.
+const FEEDBACK_MIN_VISIBLE_MS = 900;
+
 class OverlayUI {
   constructor() {
     this.nameEl = document.getElementById('exercise-name');
     this.dotsEl = document.getElementById('progress-dots');
+    this.countEl = document.getElementById('progress-count');
+    this.feedbackEl = document.getElementById('feedback-text');
+    this.badgeEl = document.getElementById('character-badge');
+    this.previewWrapEl = document.getElementById('camera-preview-wrap');
+    this.previewImgEl = document.getElementById('camera-preview');
+    this.previewLabelEl = document.getElementById('camera-preview-label');
     this.total = 0;
+    this._lastFeedbackAt = 0;
+    this._feedbackClearTimer = null;
   }
 
   setTotal(total) {
@@ -840,10 +1225,18 @@ class OverlayUI {
     }
   }
 
-  showExercise(label, index) {
+  setCharacter(characterId) {
+    const label = characterId === 'girl' ? 'Girl' : 'Boy';
+    this.badgeEl.textContent = `Character: ${label}`;
+  }
+
+  showExercise(label, index, total) {
     this.nameEl.textContent = label;
     this.nameEl.classList.add('visible');
     this.dotsEl.classList.add('visible');
+    this.countEl.textContent = PROGRESS_LABEL_FORMAT(index, total ?? this.total);
+    this.countEl.classList.add('visible');
+    this.previewWrapEl.classList.add('visible');
     const dots = this.dotsEl.children;
     for (let i = 0; i < dots.length; i++) {
       dots[i].classList.toggle('filled', i < index);
@@ -852,6 +1245,68 @@ class OverlayUI {
 
   hideExercise() {
     this.nameEl.classList.remove('visible');
+    this.clearFeedback();
+  }
+
+  // tone: 'positive' | 'neutral' | 'negative'. Respects a minimum
+  // visible duration so two updates arriving close together don't
+  // flicker — this is the display-side half of "do not spam feedback".
+  showFeedback(text, tone = 'neutral') {
+    const now = performance.now();
+    const showNow = () => {
+      this.feedbackEl.textContent = text;
+      this.feedbackEl.classList.remove('positive', 'neutral', 'negative');
+      this.feedbackEl.classList.add('visible', tone);
+      this._lastFeedbackAt = performance.now();
+    };
+    if (this._feedbackClearTimer) clearTimeout(this._feedbackClearTimer);
+    const sinceLast = now - this._lastFeedbackAt;
+    if (sinceLast >= FEEDBACK_MIN_VISIBLE_MS) {
+      showNow();
+    } else {
+      setTimeout(showNow, FEEDBACK_MIN_VISIBLE_MS - sinceLast);
+    }
+  }
+
+  clearFeedback() {
+    this.feedbackEl.classList.remove('visible');
+    if (this._feedbackClearTimer) clearTimeout(this._feedbackClearTimer);
+  }
+
+  // status: 'correct' | 'pending' | 'proceed_timeout' | null. Tints the
+  // camera preview's glow so the retry/success state is visible at a
+  // glance without reading the text.
+  setValidationState(status) {
+    this.previewWrapEl.classList.remove('state-correct', 'state-retry');
+    if (status === 'correct') this.previewWrapEl.classList.add('state-correct');
+    else if (status === 'pending') this.previewWrapEl.classList.add('state-retry');
+  }
+
+  updatePreviewFrame(base64Jpeg) {
+    // A real frame arriving is definitive: whatever "waiting" state we
+    // were in (opening or even a previous unavailable verdict) is over.
+    this.previewWrapEl.classList.remove('no-camera', 'waiting');
+    this.previewWrapEl.classList.add('visible');
+    this.previewImgEl.src = 'data:image/jpeg;base64,' + base64Jpeg;
+  }
+
+  // status: 'opening' | 'available' | 'unavailable'. The preview panel
+  // becomes visible immediately on ANY of these — including 'opening' —
+  // rather than waiting for the first exercise to begin, specifically
+  // so it's never sitting there blank with no explanation while the
+  // camera is still starting up.
+  setCameraStatus(status) {
+    this.previewWrapEl.classList.add('visible');
+    if (status === 'opening') {
+      this.previewWrapEl.classList.add('waiting');
+      this.previewWrapEl.classList.remove('no-camera');
+      this.previewLabelEl.textContent = 'Starting camera…';
+    } else if (status === 'unavailable') {
+      this.previewWrapEl.classList.add('waiting', 'no-camera');
+      this.previewLabelEl.textContent = 'Camera unavailable — continuing without validation';
+    } else {
+      this.previewWrapEl.classList.remove('waiting', 'no-camera');
+    }
   }
 }
 
@@ -918,12 +1373,90 @@ async function main() {
   const container = document.getElementById('canvas-container');
   console.log('[viewer] container size:', container.clientWidth, container.clientHeight);
 
+  // Overlay + camera bridge wiring happens BEFORE any 3D asset loading
+  // starts below. The Python side already opens the camera before
+  // viewer.html is even loaded (see ExerciseValidationCoordinator.start
+  // in exercise_validation_coordinator.py) — wiring these listeners
+  // this early means preview frames can start arriving as soon as
+  // possible.
+  //
+  // cameraReadyPromise below is the actual fix for "the first exercise
+  // already started and the camera box was still blank": previously
+  // nothing gated the environment reveal or the exercise scheduler on
+  // camera readiness at all — wiring the listeners early only meant
+  // frames COULD arrive early, not that anything waited for them. Now
+  // the environment reveal (and therefore the first exercise) cannot
+  // happen until the camera has either delivered its first real frame
+  // or definitively reported itself unavailable — so the preview panel
+  // is never shown blank with an exercise already running behind it.
+  const overlay = new OverlayUI();
+  let _cameraReadyResolve = null;
+  const cameraReadyPromise = new Promise((resolve) => { _cameraReadyResolve = resolve; });
+  const resolveCameraReady = () => { if (_cameraReadyResolve) { _cameraReadyResolve(); _cameraReadyResolve = null; } };
+
+  if (pyBridge) {
+    if (pyBridge.validation_update && typeof pyBridge.validation_update.connect === 'function') {
+      pyBridge.validation_update.connect((exerciseId, status, feedback) => {
+        if (_activeValidationHandler) _activeValidationHandler(exerciseId, status, feedback);
+      });
+    }
+    if (pyBridge.preview_frame && typeof pyBridge.preview_frame.connect === 'function') {
+      pyBridge.preview_frame.connect((b64) => {
+        overlay.updatePreviewFrame(b64);
+        resolveCameraReady();   // first real frame = camera is ready
+      });
+    }
+    if (pyBridge.camera_status && typeof pyBridge.camera_status.connect === 'function') {
+      pyBridge.camera_status.connect((status) => {
+        overlay.setCameraStatus(status);
+        // 'opening' (fired immediately when the coordinator starts) is
+        // deliberately NOT a resolve condition — it just means "still
+        // probing for a camera device", which is exactly the state
+        // we're waiting through. 'unavailable' is Python's own
+        // definitive verdict (fired after
+        // ExerciseEnvironment.CAMERA_STATUS_GRACE_MS with no frames) —
+        // just as "ready to proceed" as an actual frame arriving;
+        // there's nothing further to wait for once the camera has
+        // conclusively failed to show up.
+        if (status === 'unavailable') resolveCameraReady();
+      });
+    }
+    // Absolute safety net, independent of the two paths above: must
+    // exceed ExerciseEnvironment.CAMERA_STATUS_GRACE_MS (12000ms) with
+    // real margin so Python's own definitive 'unavailable' signal gets
+    // the chance to arrive and be shown first — this only fires if the
+    // bridge itself is somehow stalled and neither signal ever comes
+    // through, so the routine still isn't stuck forever.
+    setTimeout(resolveCameraReady, 13_000);
+  } else {
+    // No bridge at all — show the "camera unavailable" placeholder
+    // immediately rather than an indefinitely blank preview panel,
+    // and there's nothing to wait for.
+    overlay.setCameraStatus('unavailable');
+    resolveCameraReady();
+  }
+
   const sceneManager = new SceneManager(container);
   const cameraController = new CameraController(sceneManager.camera);
   cameraController.applyFixedFraming();
   console.log('[viewer] camera position:', sceneManager.camera.position);
 
-  console.log('[viewer] transitioning to Three.js — loading trunk seat…');
+  // ── Trunk seat, character, and grass all load concurrently WITH the
+  // camera warm-up above (kicked off immediately, not delayed behind
+  // it — no reason to waste that wait time), and the whole scene is
+  // revealed together in one fade once every piece is ready AND the
+  // camera is ready — see #canvas-container.ready in the stylesheet
+  // above, and the Promise.all combining both waits further down.
+  // Previously each piece called scene.add() as soon as its own await
+  // resolved, so they visibly appeared one at a time (trunk, then a
+  // beat later the character, then a beat later grass) while
+  // #canvas-container was already visible. Now the container stays at
+  // opacity:0 for that entire window regardless of the order pieces
+  // actually finish loading in underneath it, so the user only ever
+  // sees the finished composition appear, all at once — together with
+  // a camera that's already showing something real. ──
+  console.log('[viewer] loading trunk seat + character + grass in parallel (camera warming up alongside)…');
+
   // trunkseat.glb replaces the old environment.glb entirely (Background
   // mesh, Green Lawn, everything) — environment.glb is no longer loaded
   // at all, which is the actual fix for "old grass still visible": no
@@ -940,45 +1473,41 @@ async function main() {
   //   local bounds (this file): Y [-0.2835, 0.2835], X [-0.5,0.5], Z [-0.486,0.486]
   //   solved: scale = 0.834 / 0.567 = 1.4709
   //           position.y = 0.109 - 1.4709*0.2835 = -0.308
-  const TRUNK_SCALE = 1.47086;
-  const TRUNK_POSITION = new THREE.Vector3(-0.016, -0.308, -1.483);
-  const trunkLoader = createGLTFLoader();
-  const trunkGltf = await trunkLoader.loadAsync(ASSET_PATHS.trunkseat);
-  const trunkRoot = trunkGltf.scene;
-  trunkRoot.scale.setScalar(TRUNK_SCALE);
-  trunkRoot.position.copy(TRUNK_POSITION);
-  trunkRoot.traverse((node) => {
-    if (node.isMesh) {
-      node.castShadow = false; node.receiveShadow = false;
-      const mat = node.material;
-      if (mat) {
-        // See downscaleTexture() above — real GPU-memory fix, not a
-        // workaround, for the ~250MB+ these three 4096x4096 textures
-        // cost uncompressed.
-        downscaleTexture(mat.map, 1024);
-        downscaleTexture(mat.normalMap, 1024);
-        downscaleTexture(mat.metalnessMap, 1024);
-        downscaleTexture(mat.roughnessMap, 1024);
+  async function loadTrunkSeat() {
+    const TRUNK_SCALE = 1.47086;
+    const TRUNK_POSITION = new THREE.Vector3(-0.016, -0.308, -1.483);
+    const trunkLoader = createGLTFLoader();
+    const trunkGltf = await trunkLoader.loadAsync(ASSET_PATHS.trunkseat);
+    const trunkRoot = trunkGltf.scene;
+    trunkRoot.scale.setScalar(TRUNK_SCALE);
+    trunkRoot.position.copy(TRUNK_POSITION);
+    trunkRoot.traverse((node) => {
+      if (node.isMesh) {
+        node.castShadow = false; node.receiveShadow = false;
+        const mat = node.material;
+        if (mat) {
+          // See downscaleTexture() above — real GPU-memory fix, not a
+          // workaround, for the ~250MB+ these three 4096x4096 textures
+          // cost uncompressed.
+          downscaleTexture(mat.map, 1024);
+          downscaleTexture(mat.normalMap, 1024);
+          downscaleTexture(mat.metalnessMap, 1024);
+          downscaleTexture(mat.roughnessMap, 1024);
+        }
       }
-    }
-  });
-  sceneManager.scene.add(trunkRoot);
-  {
+    });
+    sceneManager.scene.add(trunkRoot);
     const b = new THREE.Box3().setFromObject(trunkRoot);
     console.log('[viewer] trunkseat.glb world bounds - min:', b.min, 'max:', b.max,
       '(target: top 0.109, bottom -0.725 — should match)');
+    // Heads-up left in console, not silently swallowed: this asset is
+    // 266,268 vertices — very heavy for a static prop (typical of
+    // AI-generated/un-retopologized meshes). Kept as-is per instruction
+    // to use this file directly; worth decimating in Blender later if
+    // it turns out to cost noticeable frame time.
+    console.log('[viewer] NOTE: trunkseat.glb has 266,268 vertices — heavy for a static prop, flagging for awareness.');
+    return trunkRoot;
   }
-  // Heads-up left in console, not silently swallowed: this asset is
-  // 266,268 vertices — very heavy for a static prop (typical of
-  // AI-generated/un-retopologized meshes). Kept as-is per instruction to
-  // use this file directly; worth decimating in Blender later if it
-  // turns out to cost noticeable frame time.
-  console.log('[viewer] NOTE: trunkseat.glb has 266,268 vertices — heavy for a static prop, flagging for awareness.');
-
-  const characterLoader = new CharacterLoader(sceneManager.scene);
-  const character = await characterLoader.load(getCharacterFromURL());
-  console.log('[viewer] character loaded:', character.characterId, '- scene children now:', sceneManager.scene.children.length);
-  console.log('[viewer] resolved clips:', character.clips);
 
   // ── Composition match to reference image (camera left untouched) ──
   // Camera is unchanged: FOV 38, position (0,1.5,4.2), lookAt(0,1,0).
@@ -986,11 +1515,18 @@ async function main() {
   // about the character's own root relative to its default identity
   // transform, independent of which trunk asset is used, so swapping
   // trunkseat.glb doesn't affect it.
-  const COMPOSITION_SCALE = 1.4887;
-  const COMPOSITION_POSITION = new THREE.Vector3(0.00782, -0.65043, -0.60586);
-  character.root.scale.setScalar(COMPOSITION_SCALE);
-  character.root.position.copy(COMPOSITION_POSITION);
-  console.log('[viewer] character composition scale/position applied:', COMPOSITION_SCALE, COMPOSITION_POSITION);
+  async function loadCharacterInto(scene) {
+    const characterLoader = new CharacterLoader(scene);
+    const character = await characterLoader.load(getCharacterFromURL());
+    console.log('[viewer] character loaded:', character.characterId, '- scene children now:', scene.children.length);
+    console.log('[viewer] resolved clips:', character.clips);
+    const COMPOSITION_SCALE = 1.4887;
+    const COMPOSITION_POSITION = new THREE.Vector3(0.00782, -0.65043, -0.60586);
+    character.root.scale.setScalar(COMPOSITION_SCALE);
+    character.root.position.copy(COMPOSITION_POSITION);
+    console.log('[viewer] character composition scale/position applied:', COMPOSITION_SCALE, COMPOSITION_POSITION);
+    return character;
+  }
 
   // ── Grass field ──
   // groundY (-0.725) and the trunk's world (x,z) position (-0.016,-1.483)
@@ -1004,30 +1540,102 @@ async function main() {
   // (0.15-0.20m, anchored to the character's real ~1.75m scale). The
   // "no black space" requirement is handled structurally by the
   // ground-fill plane inside GrassField.load (see its comments) rather
-  // than by relying on instance count/density alone — that would need
-  // hundreds of extra tuft instances just to close small gaps, at a
-  // real cost of hundreds of thousands of triangles for zero visual
-  // gain over a 2-triangle color-matched plane.
-  try {
-    const grassField = new GrassField(sceneManager.scene);
-    await grassField.load(ASSET_PATHS.grassTuft, {
-      groundY: -0.725,
-      avoidCenter: { x: -0.016, z: -1.483 },
-      avoidRadius: 0.35,
-      baseScale: 3.5,
-    });
-  } catch (err) {
-    console.error('[viewer] grass field failed to load (continuing without it):', err);
+  // than by relying on instance count/density alone.
+  //
+  // avoidRadius 0.28 -> 0.24: several marked-empty spots in a follow-up
+  // screenshot sat close in on either side of the trunk/character —
+  // shrinking the exclusion disc further reaches closer to it, at zero
+  // added triangle cost (same density, just less area excluded).
+  //
+  // Per-instance scale variance 0.85-1.15 -> 0.80-1.30: also zero added
+  // triangles (same instance count, same geometry) — a wider size
+  // spread breaks up the grid-like "same-size tufts" look and reads as
+  // fuller/more organic coverage over the same footprint.
+  //
+  // A follow-up marked-up screenshot showed the remaining empty spots
+  // were mostly OUTSIDE the old width bounds entirely (far left/right,
+  // near the tree line) — no amount of density inside those bounds
+  // could ever have reached them, so the actual fix was widening
+  // grassWidthAtDepth's calibration (see that function) to cover more
+  // ground sideways. A pure texture-based fill was tried as a
+  // zero-triangle-cost alternative and reverted — it visibly looked
+  // wrong (washed-out/blotchy) rather than like grass, so real tuft
+  // coverage is worth its triangle cost here after all. To keep the
+  // total triangle count close to the previous safe ~1.37M figure
+  // rather than adding straight on top of it, SPACING's density
+  // multiplier was nudged down slightly (0.52 -> 0.55) to compensate —
+  // see that comment for the exact numbers. Net result: ~235 tufts /
+  // ~1.35M triangles, covering visibly more ground than before at
+  // roughly the same total budget, not a meaningfully larger one.
+  async function loadGrassInto(scene) {
+    try {
+      const grassField = new GrassField(scene);
+      await grassField.load(ASSET_PATHS.grassTuft, {
+        groundY: -0.725,
+        avoidCenter: { x: -0.016, z: -1.483 },
+        avoidRadius: 0.24,
+        baseScale: 3.5,
+      });
+      return grassField;
+    } catch (err) {
+      console.error('[viewer] grass field failed to load (continuing without it):', err);
+      return null;
+    }
   }
 
+  // Environment assets AND the camera both have to be ready before
+  // anything is revealed or the exercise routine starts — see
+  // cameraReadyPromise above. Assets were already loading in parallel
+  // with the camera warm-up (not delayed behind it), so this Promise.all
+  // just waits for whichever of the two finishes last; it doesn't add
+  // extra serial wait time on top of either one individually.
+  const [[, character]] = await Promise.all([
+    Promise.all([
+      loadTrunkSeat(),
+      loadCharacterInto(sceneManager.scene),
+      loadGrassInto(sceneManager.scene),
+    ]),
+    cameraReadyPromise,
+  ]);
+
   document.getElementById('loading').style.display = 'none';
+  container.classList.add('ready');
+  console.log('[viewer] environment ready — trunk, character, grass, AND camera all revealed together');
 
   sceneManager.onUpdate((dt) => character.mixer.update(dt));
 
   console.log('[viewer] starting render loop / exercise scheduler');
   const animationController = new AnimationController(character);
-  const overlay = new OverlayUI();
-  const scheduler = new ExerciseScheduler(animationController, overlay);
+  overlay.setCharacter(character.characterId);
+
+  const scheduler = new ExerciseScheduler(animationController, overlay, pyBridge);
+
+  // ── Spacebar-x3 early exit ──────────────────────────────────────────
+  // Only arms once at least SPACEBAR_EXIT_MIN_COMPLETED exercises have
+  // had their turn (scheduler.completedCount) — pressing spacebar
+  // before that does nothing at all, so it can't be triggered by
+  // accident early in the routine. Once armed, 3 presses landing within
+  // SPACEBAR_EXIT_WINDOW_MS of each other ("back to back") trigger
+  // triggerEarlyExit(), which races the currently in-flight exercise
+  // and routes through the exact same onSessionComplete path as a
+  // normal finish — so it gets the same smooth hand-off into the
+  // Closing Animation, not an abrupt cut.
+  const SPACEBAR_EXIT_MIN_COMPLETED = 4;
+  const SPACEBAR_EXIT_PRESSES = 3;
+  const SPACEBAR_EXIT_WINDOW_MS = 1500;
+  let _exitPressTimestamps = [];
+  window.addEventListener('keydown', (e) => {
+    if (e.code !== 'Space' && e.key !== ' ') return;
+    if (scheduler.completedCount < SPACEBAR_EXIT_MIN_COMPLETED) return;
+    const now = performance.now();
+    _exitPressTimestamps.push(now);
+    _exitPressTimestamps = _exitPressTimestamps.filter((t) => now - t <= SPACEBAR_EXIT_WINDOW_MS);
+    if (_exitPressTimestamps.length >= SPACEBAR_EXIT_PRESSES) {
+      console.log('[viewer] spacebar x3 detected after', scheduler.completedCount, 'exercises — exiting early');
+      _exitPressTimestamps = [];
+      scheduler.triggerEarlyExit();
+    }
+  });
 
   scheduler.onSessionComplete(() => {
     if (pyBridge && pyBridge.session_complete) {

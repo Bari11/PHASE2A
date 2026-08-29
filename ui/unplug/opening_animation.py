@@ -733,8 +733,27 @@ class OpeningAnimation(QWidget):
 
     def _finish(self):
         self._tick_timer.stop()
-        self.hide()
+        # Deliberately NOT self.hide() here — see dismiss() below.
         self.animation_done.emit()
+
+    def dismiss(self):
+        """
+        Call this only AFTER the next full-screen window (typically
+        ExerciseEnvironment) has already been shown and raised on top.
+        Previously _finish() called self.hide() itself, immediately
+        before emitting animation_done — since the next window's
+        creation and its own show()/raise_() happens inside the
+        animation_done handler, there was a real gap where THIS window
+        had already vanished but the NEXT one hadn't appeared yet,
+        during which the desktop underneath became briefly visible
+        (worse the longer the next window takes to set up — e.g. while
+        ExerciseEnvironment's camera/coordinator init runs). Since both
+        this window and the next one are full-screen and solid black,
+        showing the next one on top FIRST and only hiding this one
+        AFTER means there is always something opaque covering the
+        screen — no frame where the desktop can show through.
+        """
+        self.hide()
 
     def closeEvent(self, event):
         self._tick_timer.stop()
