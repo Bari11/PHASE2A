@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QSystemTrayIcon, QMenu, QAction,
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QPushButton,
     QStackedWidget, QScrollArea, QGridLayout, QSizePolicy,
-    QGraphicsDropShadowEffect, QCheckBox, QProgressBar,
+    QGraphicsDropShadowEffect, QCheckBox, QProgressBar, QMessageBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QRect, QObject, QRectF
 from PyQt5.QtGui  import (
@@ -32,6 +32,7 @@ from PyQt5.QtGui  import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from core.detector      import StressPostureDetector, SessionData
 from core.notifications import NotificationOverlay
+from core import history_db
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -55,9 +56,7 @@ C = {
     'muted2':   '#94a3b8',
 }
 
-_HISTORY_FILE  = Path.home() / '.canary_history.json'
 _SETTINGS_FILE = Path.home() / '.canary_settings.json'
-MAX_HISTORY    = 20
 
 # Alert dedup: once an alert fires, don't fire the same kind again until
 # the signal clears AND then re-appears.
@@ -66,6 +65,23 @@ CAMERA_ALERT_COOLDOWN  = 30.0  # don't spam camera alerts
 
 HORIZON_INTERVAL_MS      = 20 * 60 * 1000  # 20-20-20 rule: every 20 minutes during an active session
 HORIZON_LOOKAWAY_COOLDOWN = 15.0            # seconds between "please look away" nudges while Horizon Mode is active
+
+# ── Calm Mode — automatic high-stress trigger (Phase 3) ────────────────────
+# NOTE: these are starting points for real-world tuning, not scientifically
+# derived thresholds. They gate an EDGE (rising above threshold, falling
+# below recovery) rather than reacting to any single frame.
+CALM_STRESS_THRESHOLD  = 0.65   # stress_score that can start the countdown to an automatic Calm
+CALM_STRESS_DURATION   = 60.0   # seconds stress must stay >= CALM_STRESS_THRESHOLD before Calm actually fires
+CALM_RECOVERY_LEVEL    = 0.40   # stress must drop below this to re-arm automatic Calm
+CALM_RECOVERY_DURATION = 20.0   # seconds stress must stay below CALM_RECOVERY_LEVEL to re-arm
+
+# ── Unplug Mode — automatic alert-threshold trigger (Phase 3) ──────────────
+UNPLUG_ALERT_THRESHOLD = 30        # meaningful (edge-triggered) posture/stress alerts before Unplug is considered
+UNPLUG_COOLDOWN        = 30 * 60   # seconds after an AUTOMATIC Unplug before another automatic one can fire
+
+# ── Calm → recovery → Unplug chain (Phase 3) ────────────────────────────────
+CALM_UNPLUG_RECOVERY_INTERVAL  = 90.0             # seconds to wait after an alert-triggered Calm before reassessing stress
+POST_CALM_STILL_ELEVATED_LEVEL = CALM_STRESS_THRESHOLD  # stress at/above this after the recovery interval → launch Unplug
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -77,6 +93,11 @@ DEFAULT_SETTINGS = {
     'voice_gender':  'female',
     'unplug_enabled': True,
     'unplug_gender':  'boy',
+    # NOTE: no SettingsPage checkbox wires these up yet (Phase 3 scope was
+    # orchestration, not settings UI) — they default on so automatic Horizon/
+    # Calm behave exactly as before until a toggle is added. See report.
+    'horizon_enabled': True,
+    'calm_enabled':    True,
 }
 
 def _load_settings() -> dict:
@@ -97,19 +118,26 @@ def _save_settings(s: dict):
 #  History
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  History (Phase 4: SQLite-backed — see core/history_db.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# How many recent completed sessions to keep in memory for the dashboard's
+# comparison/trend views (SessionResultsPage). The database itself keeps
+# every session forever; this only bounds what's loaded into the UI at once.
+HISTORY_MEMORY_CAP = 200
+
 def _load_history() -> List[dict]:
-    try:
-        if _HISTORY_FILE.exists():
-            return json.loads(_HISTORY_FILE.read_text())
-    except Exception: pass
-    return []
+    return history_db.fetch_sessions(limit=HISTORY_MEMORY_CAP)
 
-def _save_history(h: List[dict]):
-    try: _HISTORY_FILE.write_text(json.dumps(h[-MAX_HISTORY:], indent=2))
-    except Exception: pass
-
-def _session_to_dict(sd: SessionData) -> dict:
-    return {
+def _session_to_dict(sd: SessionData, extra: Optional[dict] = None) -> dict:
+    """
+    `extra` carries the Phase-3/Unplug data SessionData itself has no way
+    to know about (meaningful-alert count, Horizon/Calm/Unplug usage during
+    THIS session) — see TrayApp._finish_stopping_session, which is the only
+    caller that passes it.
+    """
+    d = {
         'start':            sd.start_time,
         'end':              sd.end_time,
         'duration_min':     sd.duration_min,
@@ -121,6 +149,14 @@ def _session_to_dict(sd: SessionData) -> dict:
         'stress_alerts':    sd.stress_alerts,
         'appreciation':     sd.appreciation_alerts,
         'water':            sd.water_alerts,
+        'meaningful_alerts':          0,
+        'horizon_uses':               0,
+        'horizon_secs':               0.0,
+        'calm_uses':                  0,
+        'calm_secs':                  0.0,
+        'unplug_uses':                0,
+        'unplug_secs':                0.0,
+        'unplug_exercises_completed': 0,
         'events':           [
             {
                 'ts':      e.timestamp,
@@ -131,6 +167,9 @@ def _session_to_dict(sd: SessionData) -> dict:
             for e in sd.events
         ],
     }
+    if extra:
+        d.update(extra)
+    return d
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -675,6 +714,8 @@ def _recommendations(sd: SessionData, prev: Optional[dict]) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SessionResultsPage(QWidget):
+    clear_history_requested = pyqtSignal()
+
     def __init__(self,parent=None):
         super().__init__(parent); self.setStyleSheet(f'background:{C["bg"]};')
         self._scroll=QScrollArea(); self._scroll.setWidgetResizable(True)
@@ -694,6 +735,17 @@ class SessionResultsPage(QWidget):
                              size=10,color=C['muted'],align=Qt.AlignCenter))
         self._scroll.setWidget(w)
 
+    def _confirm_clear_history(self):
+        reply = QMessageBox.question(
+            self, 'Clear Session History',
+            'This permanently deletes all STORED session history '
+            '(comparisons, trends, and the previous-sessions list).\n\n'
+            'It will NOT affect a session currently in progress.\n\n'
+            'This cannot be undone. Continue?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            self.clear_history_requested.emit()
+
     def load(self,sd:SessionData,history:List[dict]):
         prev=history[-2] if len(history)>=2 else None
         w=QWidget(); w.setStyleSheet(f'background:{C["bg"]};')
@@ -704,6 +756,13 @@ class SessionResultsPage(QWidget):
         hdr.addStretch()
         mins=int(sd.duration_min); secs=int((sd.duration_min-mins)*60)
         hdr.addWidget(_label(f'Duration: {mins}m {secs}s',size=10,color=C['muted']))
+        clear_btn = QPushButton('🗑  Clear History')
+        clear_btn.setCursor(Qt.PointingHandCursor)
+        clear_btn.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['muted']};
+            border:1px solid {C['border']};border-radius:6px;padding:4px 12px;font-size:9pt;}}
+            QPushButton:hover{{color:{C['red']};border-color:{C['red']};}}""")
+        clear_btn.clicked.connect(self._confirm_clear_history)
+        hdr.addSpacing(12); hdr.addWidget(clear_btn)
         lv.addLayout(hdr)
 
         # Session timestamp
@@ -820,6 +879,74 @@ class SessionResultsPage(QWidget):
                                        size=10, bold=True, color=C['muted2']))
             lv.addWidget(sh_card)
 
+        # ── Progress over time (Phase 4) ────────────────────────────────────────
+        # "Hourly/weekly/monthly progress" — interpreted as rolling-window
+        # summaries (today / this week / this month) over the full stored
+        # session history, since a single Canary session already spans well
+        # beyond one calendar hour. All-time totals come from the SAME
+        # `history` list (now backed by history_db, unbounded — see
+        # HISTORY_MEMORY_CAP), not from a fixed most-recent-20 cutoff.
+        lv.addWidget(_label('PROGRESS OVER TIME',size=8,color=C['muted']))
+        now_ts = sd.end_time
+        windows = [
+            ('Today',      24*3600,      C['blue']),
+            ('This Week',  7*24*3600,    C['purple']),
+            ('This Month', 30*24*3600,   C['canary']),
+        ]
+        prog_row = QHBoxLayout(); prog_row.setSpacing(10)
+        for label, span, col in windows:
+            bucket = [s for s in history if now_ts - s.get('start', 0) <= span]
+            gc = GlowCard(col); gl3 = QVBoxLayout(gc); gl3.setContentsMargins(14,10,14,10); gl3.setSpacing(2)
+            gl3.addWidget(_label(label, size=9, color=C['muted']))
+            gl3.addWidget(_label(f'{len(bucket)} session(s)', size=14, bold=True, color=col))
+            if bucket:
+                avg_gp = sum(s.get('good_posture_pct',0) for s in bucket)/len(bucket)
+                total_ma = sum(s.get('meaningful_alerts',0) for s in bucket)
+                gl3.addWidget(_label(f'Avg good posture {avg_gp:.0f}%  •  {total_ma} meaningful alert(s)',
+                                      size=8, color=C['muted2']))
+            else:
+                gl3.addWidget(_label('No sessions yet', size=8, color=C['muted2']))
+            prog_row.addWidget(gc)
+        lv.addLayout(prog_row)
+
+        # Overall trend: most recent few sessions vs everything before them.
+        if len(history) >= 4:
+            recent_n = min(5, len(history)//2)
+            recent = history[-recent_n:]
+            older   = history[:-recent_n]
+            avg_recent = sum(s.get('good_posture_pct',0) for s in recent)/len(recent)
+            avg_older  = sum(s.get('good_posture_pct',0) for s in older)/len(older)
+            trend_card = GlowCard(C['green'] if avg_recent >= avg_older else C['yellow'])
+            tl = QVBoxLayout(trend_card); tl.setContentsMargins(14,10,14,10); tl.setSpacing(4)
+            tl.addWidget(_label(f'OVERALL TREND  ({len(history)} session(s) on record)', size=8, color=C['muted']))
+            if avg_recent >= avg_older + 3:
+                tl.addWidget(_label(f'📈  Good posture trending up: {avg_older:.0f}% → {avg_recent:.0f}% (last {recent_n})',
+                                     size=10, bold=True, color=C['green']))
+            elif avg_recent <= avg_older - 3:
+                tl.addWidget(_label(f'📉  Good posture trending down: {avg_older:.0f}% → {avg_recent:.0f}% (last {recent_n})',
+                                     size=10, bold=True, color=C['yellow']))
+            else:
+                tl.addWidget(_label(f'≈  Holding steady around {avg_recent:.0f}% good posture',
+                                     size=10, bold=True, color=C['muted2']))
+            lv.addWidget(trend_card)
+
+        # Previous sessions list (most recent first, capped for readability)
+        if len(history) >= 2:
+            lv.addWidget(_label('PREVIOUS SESSIONS',size=8,color=C['muted']))
+            hist_card = GlowCard(C['muted2']); hist_card.setMinimumHeight(0)
+            hl_ = QVBoxLayout(hist_card); hl_.setContentsMargins(14,10,14,10); hl_.setSpacing(6)
+            for s in list(reversed(history[:-1]))[:10]:
+                when = datetime.fromtimestamp(s.get('start',0)).strftime('%a %d %b, %H:%M')
+                row_ = QHBoxLayout()
+                row_.addWidget(_label(when, size=9, color=C['muted2']))
+                row_.addWidget(_label(f"{s.get('duration_min',0):.0f} min", size=9, color=C['muted']))
+                row_.addWidget(_label(f"{s.get('good_posture_pct',0):.0f}% good posture", size=9, color=C['green']))
+                row_.addWidget(_label(f"{s.get('posture_alerts',0)} posture / {s.get('stress_alerts',0)} stress",
+                                       size=9, color=C['muted']))
+                row_.addStretch()
+                hl_.addLayout(row_)
+            lv.addWidget(hist_card)
+
         lv.addWidget(_label('WELLNESS SCORES',size=8,color=C['muted']))
         sc_row=QHBoxLayout(); sc_row.setSpacing(10)
         for lbl,val,col in [
@@ -835,6 +962,111 @@ class SessionResultsPage(QWidget):
         lv.addWidget(_label('INSIGHTS & RECOMMENDATIONS',size=8,color=C['muted']))
         for args in _recommendations(sd,prev): lv.addWidget(RecCard(*args))
         lv.addStretch(); self._scroll.setWidget(w)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Mode Statistics Page (Phase 4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ModeStatsPage(QWidget):
+    """
+    Reads core/history_db.fetch_mode_usage() directly — every Horizon/Calm/
+    Unplug run ever recorded, session or standalone (see TrayApp.
+    _record_mode_run). Only shows metrics Canary actually collects: no
+    fabricated scores or invented streaks.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent); self.setStyleSheet(f'background:{C["bg"]};')
+        self._scroll = QScrollArea(); self._scroll.setWidgetResizable(True)
+        self._scroll.setStyleSheet(
+            'QScrollArea{border:none;background:transparent;}'
+            f'QScrollBar:vertical{{background:{C["card"]};width:6px;border-radius:3px;}}'
+            f'QScrollBar::handle:vertical{{background:#8b5cf6;border-radius:3px;}}')
+        outer = QVBoxLayout(self); outer.setContentsMargins(0,0,0,0)
+        outer.addWidget(self._scroll)
+        self.refresh()
+
+    @staticmethod
+    def _fmt_secs(total_secs: float) -> str:
+        total_secs = int(total_secs)
+        if total_secs < 60: return f'{total_secs}s'
+        m, s = divmod(total_secs, 60)
+        if m < 60: return f'{m}m {s}s'
+        h, m = divmod(m, 60)
+        return f'{h}h {m}m'
+
+    @staticmethod
+    def _fmt_recency(ts: float) -> str:
+        delta = time.time() - ts
+        if delta < 3600:      return f'{int(delta//60)} min ago'
+        if delta < 86400:     return f'{int(delta//3600)} hr ago'
+        return datetime.fromtimestamp(ts).strftime('%a %d %b, %H:%M')
+
+    def refresh(self):
+        w = QWidget(); w.setStyleSheet(f'background:{C["bg"]};')
+        lv = QVBoxLayout(w); lv.setContentsMargins(24,20,24,24); lv.setSpacing(20)
+        lv.addWidget(_label('📈  Mode Statistics', size=15, bold=True))
+        lv.addWidget(_label('Usage across every Horizon, Calm, and Unplug run — '
+                             'manual or automatic, with or without an active session.',
+                             size=9, color=C['muted']))
+
+        specs = [
+            ('horizon', '👁️', 'Horizon Mode', C['blue']),
+            ('calm',    '🌊', 'Calm Mode',    C['purple']),
+            ('unplug',  '🔌', 'Unplug Mode',  C['canary']),
+        ]
+        any_data = False
+        for mode, ico, title, col in specs:
+            runs = history_db.fetch_mode_usage(mode)
+            gc = GlowCard(col); gc.setMinimumHeight(0)
+            gl = QVBoxLayout(gc); gl.setContentsMargins(18,16,18,16); gl.setSpacing(10)
+            gl.addWidget(_label(f'{ico}  {title}', size=12, bold=True, color=col))
+
+            if not runs:
+                gl.addWidget(_label('Not used yet.', size=10, color=C['muted']))
+                lv.addWidget(gc)
+                continue
+            any_data = True
+
+            total_secs   = sum(r['duration_secs'] for r in runs)
+            during_sess  = sum(1 for r in runs if r['during_session'])
+            standalone   = len(runs) - during_sess
+            last_run     = runs[-1]
+
+            grid = QGridLayout(); grid.setSpacing(10)
+            grid.addWidget(StatTile('🔁','Times Used',len(runs),'',col), 0, 0)
+            grid.addWidget(StatTile('⏱️','Total Time',self._fmt_secs(total_secs),'',col), 0, 1)
+            grid.addWidget(StatTile('🕐','Last Used',self._fmt_recency(last_run['start_time']),'',col), 0, 2)
+            gl.addLayout(grid)
+            gl.addWidget(_label(
+                f'{during_sess} during a session  •  {standalone} standalone (manual, no session)',
+                size=9, color=C['muted2']))
+
+            if mode == 'calm':
+                for_unplug = sum(1 for r in runs if r['extra'].get('for_unplug'))
+                gl.addWidget(_label(
+                    f'{for_unplug} triggered as stage 1 of an automatic Unplug  •  '
+                    f'{len(runs) - for_unplug} manual or standalone high-stress trigger',
+                    size=9, color=C['muted2']))
+
+            if mode == 'unplug':
+                completed = sum(1 for r in runs if r['completed'])
+                exercises = sum(r['extra'].get('exercises_completed', 0) for r in runs)
+                automatic_note = sum(1 for r in runs if r['extra'].get('character'))
+                if runs:
+                    gl.addWidget(_label(
+                        f'{completed}/{len(runs)} completed the full exercise routine  •  '
+                        f'{exercises} exercise(s) completed in total',
+                        size=9, color=C['muted2']))
+
+            lv.addWidget(gc)
+
+        if not any_data:
+            lv.addWidget(_label('No Horizon, Calm, or Unplug usage recorded yet.',
+                                 size=10, color=C['muted']))
+
+        lv.addStretch()
+        self._scroll.setWidget(w)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -912,6 +1144,42 @@ class SettingsPage(QWidget):
         self.btn_vm.setChecked(self._s['voice_gender']=='male')
         self._style_voice(); vl.addLayout(gr)
         iv.addWidget(vc)
+
+        # ── Horizon Mode ───────────────────────────────────────────────────────
+        sec_header('👁️', 'Horizon Mode')
+        hzc = make_card(C['blue']); hzc.setMinimumHeight(0)
+        hzl = QVBoxLayout(hzc); hzl.setContentsMargins(22,20,22,20); hzl.setSpacing(18)
+        hzr = QHBoxLayout()
+        hzi = QVBoxLayout(); hzi.setSpacing(3)
+        hzl_lbl = QLabel('Enable Horizon Mode')
+        hzl_lbl.setStyleSheet(f'color:{C["text"]};font-size:11pt;font-weight:bold;background:transparent;')
+        hzd = QLabel('20-20-20 eye-rest reminder every 20 minutes during a session')
+        hzd.setStyleSheet(f'color:{C["muted2"]};font-size:10pt;background:transparent;')
+        hzi.addWidget(hzl_lbl); hzi.addWidget(hzd)
+        hzr.addLayout(hzi); hzr.addStretch()
+        self.horizon_chk = QCheckBox()
+        self.horizon_chk.setChecked(self._s.get('horizon_enabled', True))
+        self.horizon_chk.setStyleSheet(toggle_style())
+        hzr.addWidget(self.horizon_chk); hzl.addLayout(hzr)
+        iv.addWidget(hzc)
+
+        # ── Calm Mode ──────────────────────────────────────────────────────────
+        sec_header('🌊', 'Calm Mode')
+        clc = make_card(C['purple']); clc.setMinimumHeight(0)
+        cll = QVBoxLayout(clc); cll.setContentsMargins(22,20,22,20); cll.setSpacing(18)
+        clr = QHBoxLayout()
+        cli = QVBoxLayout(); cli.setSpacing(3)
+        cll_lbl = QLabel('Enable Calm Mode')
+        cll_lbl.setStyleSheet(f'color:{C["text"]};font-size:11pt;font-weight:bold;background:transparent;')
+        cld = QLabel('Automatic breathing break during sustained high stress')
+        cld.setStyleSheet(f'color:{C["muted2"]};font-size:10pt;background:transparent;')
+        cli.addWidget(cll_lbl); cli.addWidget(cld)
+        clr.addLayout(cli); clr.addStretch()
+        self.calm_chk = QCheckBox()
+        self.calm_chk.setChecked(self._s.get('calm_enabled', True))
+        self.calm_chk.setStyleSheet(toggle_style())
+        clr.addWidget(self.calm_chk); cll.addLayout(clr)
+        iv.addWidget(clc)
 
         # ── Unplug Mode ────────────────────────────────────────────────────────
         sec_header('🔌', 'Unplug Mode')
@@ -991,6 +1259,8 @@ class SettingsPage(QWidget):
         self.voice_chk.stateChanged.connect(self._emit)
         self.btn_vf.clicked.connect(lambda: self._vgender('female'))
         self.btn_vm.clicked.connect(lambda: self._vgender('male'))
+        self.horizon_chk.stateChanged.connect(self._emit)
+        self.calm_chk.stateChanged.connect(self._emit)
         self.unplug_chk.stateChanged.connect(self._emit)
         self.btn_cg_boy.clicked.connect(lambda: self._cgender('boy'))
         self.btn_cg_girl.clicked.connect(lambda: self._cgender('girl'))
@@ -1037,11 +1307,15 @@ class SettingsPage(QWidget):
 
     def _emit(self):
         self._s['voice_enabled'] = self.voice_chk.isChecked()
+        self._s['horizon_enabled'] = self.horizon_chk.isChecked()
+        self._s['calm_enabled'] = self.calm_chk.isChecked()
         self._s['unplug_enabled'] = self.unplug_chk.isChecked()
         self.settings_changed.emit(dict(self._s))
 
     def get_settings(self) -> dict:
         self._s['voice_enabled'] = self.voice_chk.isChecked()
+        self._s['horizon_enabled'] = self.horizon_chk.isChecked()
+        self._s['calm_enabled'] = self.calm_chk.isChecked()
         self._s['unplug_enabled'] = self.unplug_chk.isChecked()
         return dict(self._s)
 
@@ -1051,7 +1325,7 @@ class SettingsPage(QWidget):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DashboardWindow(QMainWindow):
-    TABS = [('📡', 'Live'), ('📊', 'Session Results'), ('⚙️', 'Settings')]
+    TABS = [('📡', 'Live'), ('📊', 'Session Results'), ('📈', 'Mode Statistics'), ('⚙️', 'Settings')]
 
     def __init__(self, settings:dict, tray_ref=None):
         super().__init__()
@@ -1111,14 +1385,17 @@ class DashboardWindow(QMainWindow):
         tl.addStretch(); self._style_tabs(); root.addWidget(tbar)
 
         self._stack=QStackedWidget(); self._stack.setStyleSheet(f'background:{C["bg"]};')
-        self._live    = LiveDashboardPage()
-        self._results = SessionResultsPage()
+        self._live       = LiveDashboardPage()
+        self._results    = SessionResultsPage()
+        self._mode_stats = ModeStatsPage()
         self._settings_page = SettingsPage(self._settings)
-        self._stack.addWidget(self._live)       # 0
-        self._stack.addWidget(self._results)    # 1
-        self._stack.addWidget(self._settings_page)  # 2
+        self._stack.addWidget(self._live)         # 0
+        self._stack.addWidget(self._results)      # 1
+        self._stack.addWidget(self._mode_stats)   # 2
+        self._stack.addWidget(self._settings_page)  # 3
         root.addWidget(self._stack)
 
+        self._results.clear_history_requested.connect(self._on_clear_history)
         self._settings_page.settings_changed.connect(self._on_settings)
         self._session_active=False
         self._calib_timer=QTimer(self); self._calib_timer.timeout.connect(self._update_calib)
@@ -1141,6 +1418,8 @@ class DashboardWindow(QMainWindow):
     def _switch_tab(self,idx):
         for i,b in enumerate(self._tabs): b.setChecked(i==idx)
         self._style_tabs(); self._stack.setCurrentIndex(idx)
+        if idx == 2:  # Mode Statistics — pull fresh data each time it's opened
+            self._mode_stats.refresh()
 
     def _set_btn_start(self):
         self._sess_btn.setStyleSheet("""QPushButton{
@@ -1200,6 +1479,18 @@ class DashboardWindow(QMainWindow):
     def add_live_event(self, ts: float, kind: str, detail: str):
         self._live.add_event(ts, kind, detail)
 
+    def _on_clear_history(self):
+        if not self._tray:
+            return
+        remaining = self._tray.clear_session_history()
+        # The just-completed session's own report (sd) has no historical
+        # backing left to compare against now — show the placeholder rather
+        # than a comparison/trend view built on data that no longer exists.
+        # This never touches a session currently in progress: that lives
+        # only in the active detector's in-memory SessionData, untouched by
+        # clear_session_history().
+        self._results._show_placeholder()
+
     def _on_settings(self,s:dict):
         self._settings=dict(s); _save_settings(s)
         if self._tray:
@@ -1257,6 +1548,7 @@ class TrayApp(QObject):
         self.overlay.set_voice(self._settings['voice_enabled'],
                                self._settings['voice_gender'])
 
+        history_db.init_db()
         self._history=_load_history()
 
         # ── Alert state tracking for change-only alerts ───────────────────────
@@ -1303,6 +1595,62 @@ class TrayApp(QObject):
         # pure visual overlay with no automatic trigger in this phase.
         self._calm_active = False
         self._calm_mode = None
+
+        # ── Centralized mode state (Phase 3) ──────────────────────────────────
+        # Single source of truth for "is an intervention/recovery in progress".
+        # One of: IDLE, HORIZON, CALM, UNPLUG, RECOVERY_WAIT.
+        # _horizon_active/_calm_active above are kept as-is (other code reads
+        # them) but are always kept in sync with this.
+        self._active_mode = 'IDLE'
+        self._session_running = False
+
+        # Automatic Calm (sustained high stress) — hysteresis state
+        self._calm_high_stress_since: Optional[float] = None
+        self._calm_recovered_since:   Optional[float] = None
+        self._calm_rearmed = True
+        self._calm_for_unplug = False  # True only when this Calm run is stage 1 of an automatic Unplug
+
+        # Automatic Unplug (meaningful-alert threshold) — accumulator + cooldown
+        self._meaningful_alert_count = 0
+        self._unplug_cooldown_until  = 0.0
+        self._unplug_is_automatic    = False
+        self._unplug_using_shared_detector = False
+        # Set by stop_session() when Unplug is mid-run on the session's
+        # shared detector at the moment the session is stopped — holds the
+        # detector object whose teardown + session bookkeeping is deferred
+        # until Unplug's own _on_closing_done fires (see trigger_unplug_mode
+        # and stop_session/_finish_stopping_session).
+        self._pending_session_detector = None
+
+        # ── Phase 4: per-session Horizon/Calm/Unplug usage + persistent
+        # mode-usage logging. Reset in start_session(); read once, at
+        # session end, by _finish_stopping_session() to build the DB row.
+        # Cumulative meaningful-alert TOTAL for history/statistics — unlike
+        # the operational self._meaningful_alert_count above, this one is
+        # never reset mid-session (Calm-resolve/Unplug-complete reset the
+        # operational counter, not this one), so it reflects everything
+        # that happened in the session, for the record.
+        self._session_meaningful_alert_total = 0
+        self._session_horizon_uses = 0
+        self._session_horizon_secs = 0.0
+        self._session_calm_uses = 0
+        self._session_calm_secs = 0.0
+        self._session_unplug_uses = 0
+        self._session_unplug_secs = 0.0
+        self._session_unplug_exercises_completed = 0
+        # Per-run bookkeeping, set when each mode is triggered and read
+        # when it finishes (see trigger_*/​_on_*_finished below).
+        self._horizon_run_start = 0.0
+        self._horizon_run_during_session = False
+        self._calm_run_start = 0.0
+        self._calm_run_during_session = False
+        self._unplug_run_start = 0.0
+        self._unplug_run_during_session = False
+
+        # Calm → recovery → Unplug reassessment timer
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setSingleShot(True)
+        self._recovery_timer.timeout.connect(self._on_recovery_timeout)
 
         self._tray_state='idle'
 
@@ -1369,9 +1717,48 @@ class TrayApp(QObject):
 
     # ── Unplug / Horizon Mode triggers ──────────────────────────────────────────
 
-    def trigger_unplug_mode(self):
+    def _mode_busy(self) -> bool:
         """
-        Manually trigger Unplug Mode: Opening Animation -> 3D wellness
+        True while ANY intervention or the post-Calm recovery decision is in
+        progress. Every manual and automatic trigger re-checks this
+        immediately before doing anything else, so a stale QTimer callback
+        or a manual click during another mode is a safe no-op rather than a
+        second overlapping window.
+        """
+        return self._active_mode != 'IDLE'
+
+    def _record_mode_run(self, mode: str, start_ts: float, end_ts: float,
+                          during_session: bool, completed: bool,
+                          extra: Optional[dict] = None):
+        """
+        Phase 4: log one Horizon/Calm/Unplug run to the mode_usage table
+        (Mode Statistics reads this — every run, session or standalone) and,
+        if it happened during an active monitoring session, fold it into
+        this session's running totals (the sessions table reads THOSE, at
+        session end). during_session is passed in rather than re-checked
+        here because self._session_running may have already changed
+        between when the run started and when it finished.
+        """
+        history_db.insert_mode_usage(mode, start_ts, end_ts, during_session,
+                                      completed, extra)
+        if not during_session:
+            return
+        duration = max(end_ts - start_ts, 0.0)
+        if mode == 'horizon':
+            self._session_horizon_uses += 1
+            self._session_horizon_secs += duration
+        elif mode == 'calm':
+            self._session_calm_uses += 1
+            self._session_calm_secs += duration
+        elif mode == 'unplug':
+            self._session_unplug_uses += 1
+            self._session_unplug_secs += duration
+            if extra:
+                self._session_unplug_exercises_completed += extra.get('exercises_completed', 0)
+
+    def trigger_unplug_mode(self, automatic: bool = False):
+        """
+        Trigger Unplug Mode: Opening Animation -> 3D wellness
         environment (the 7-exercise sequence) -> Closing Animation.
 
         Each handoff below shows the NEXT full-screen window (already
@@ -1400,7 +1787,27 @@ class TrayApp(QObject):
         (separate-process) compositor in ExerciseEnvironment's
         QWebEngineView specifically, which processEvents() alone can't
         force to sync.
+
+        `automatic=True` is passed only by the internal Phase 3 orchestration
+        (the alert-threshold path, directly or via the Calm→recovery chain);
+        it starts the post-completion cooldown and resets the meaningful-alert
+        counter. Manual tray triggers leave both untouched, per the existing
+        "demo trigger" behavior.
         """
+        if self._mode_busy():
+            return  # another intervention (or the recovery decision) owns the screen
+        self._active_mode = 'UNPLUG'
+        self._unplug_is_automatic = automatic
+        self._unplug_run_start = time.time()
+        self._unplug_run_during_session = self._session_running
+        # Snapshot now: ExerciseEnvironment below is handed self.detector
+        # (if any) as shared_detector=. Whether THIS run is borrowing the
+        # session's detector — and therefore must not have it stopped out
+        # from under it — is fixed at trigger time, not re-derived later
+        # (self.detector may already be None by the time stop_session()
+        # runs, per the deferred-teardown logic there).
+        self._unplug_using_shared_detector = self.detector is not None
+
         try:
             from ui.unplug.opening_animation import OpeningAnimation
             from ui.unplug.exercise_environment import ExerciseEnvironment
@@ -1414,7 +1821,47 @@ class TrayApp(QObject):
                 # screen fades away. This is the one stage in the chain
                 # where revealing the desktop IS the correct final
                 # result, so ClosingAnimation hides itself as before.
-                pass
+                self._active_mode = 'IDLE'
+                if self._unplug_is_automatic:
+                    self._unplug_cooldown_until = time.time() + UNPLUG_COOLDOWN
+                    self._meaningful_alert_count = 0
+                self._unplug_is_automatic = False
+                self._unplug_using_shared_detector = False
+
+                # Phase 4: log this run (Mode Statistics + this session's
+                # totals). last_session_log is UnplugSessionLog — populated
+                # by ExerciseValidationCoordinator.finish_session() whenever
+                # the exercise routine completed normally; stays None if the
+                # window was closed before any exercise routine ran.
+                log = getattr(self._unplug_environment, 'last_session_log', None)
+                extra = None
+                unplug_completed = True
+                if log is not None:
+                    unplug_completed = bool(log.completed)
+                    extra = {
+                        'exercises_completed': len(log.entries),
+                        'cv_validated_count':  log.cv_validated_count,
+                        'character':           log.character,
+                    }
+                self._record_mode_run('unplug', self._unplug_run_start, time.time(),
+                                       self._unplug_run_during_session,
+                                       completed=unplug_completed, extra=extra)
+
+                # If stop_session() was called while this Unplug run was
+                # still using the session's detector, it deferred the
+                # actual teardown to right here (see stop_session) rather
+                # than stopping the camera out from under
+                # ExerciseValidationCoordinator mid-exercise. By this
+                # point the coordinator has already released the shared
+                # detector's frame_hook (ExerciseEnvironment._on_session_
+                # complete/closeEvent both call coordinator.stop() before
+                # animation_done fires, which is what got us here), so
+                # it's now safe to actually stop it and finish the
+                # session bookkeeping that was put on hold.
+                pending = self._pending_session_detector
+                if pending is not None:
+                    self._pending_session_detector = None
+                    self._finish_stopping_session(pending)
 
             def _on_exercises_done():
                 closing = ClosingAnimation()
@@ -1445,6 +1892,9 @@ class TrayApp(QObject):
             anim.start()
         except Exception as e:
             print(f'[Canary] Could not start Unplug Mode: {e}')
+            self._active_mode = 'IDLE'
+            self._unplug_is_automatic = False
+            self._unplug_using_shared_detector = False
 
     def trigger_horizon_mode(self):
         """
@@ -1463,8 +1913,15 @@ class TrayApp(QObject):
             it back down again afterwards — it does NOT start a real
             monitored session.
         """
-        if self._horizon_active:
-            return  # already showing; don't stack overlapping triggers
+        if self._mode_busy():
+            return  # another intervention (or recovery decision) owns the screen —
+                     # the recurring 20-min timer will simply try again next interval
+        # Claim the mode slot immediately (not just once _show_calm_screen
+        # runs) — the logo intro plays first, and a second trigger arriving
+        # during that intro must not be allowed to start a second overlay.
+        self._active_mode = 'HORIZON'
+        self._horizon_run_start = time.time()
+        self._horizon_run_during_session = self._session_running
 
         try:
             from ui.horizon.logo_intro import LogoIntro
@@ -1490,6 +1947,7 @@ class TrayApp(QObject):
 
             def _show_calm_screen():
                 self._horizon_active = True
+                self._active_mode = 'HORIZON'
                 self._last_horizon_alert_t = 0.0
 
                 # Real gaze/head-pose monitoring, not a crude proxy —
@@ -1515,20 +1973,26 @@ class TrayApp(QObject):
         except Exception as e:
             print(f'[Canary] Could not start Horizon Mode: {e}')
             self._horizon_active = False
+            self._active_mode = 'IDLE'
 
-    def trigger_calm_mode(self):
+    def trigger_calm_mode(self, for_unplug: bool = False):
         """
-        Manually trigger Calm Mode: a short ocean-blue breathing
-        particle animation (INHALE/HOLD/EXHALE, a few cycles, ending
-        in a particle smile that fades away).
+        Trigger Calm Mode: a short ocean-blue breathing particle
+        animation (INHALE/HOLD/EXHALE, a few cycles, ending in a
+        particle smile that fades away). Does not touch the
+        detector/camera.
 
-        Phase 1: manual-only. Works whether or not a session is
-        running, does not touch the detector/camera, and is not yet
-        wired to automatic stress triggering or to Unplug Mode — that
-        comes in a later phase.
+        Three entry paths, per Phase 3:
+          - Manual tray trigger (`for_unplug=False`, the default).
+          - Automatic sustained-high-stress trigger (`for_unplug=False`)
+            — a Calm that fires this way is a self-contained wellness
+            nudge and must NOT lead into Unplug afterward.
+          - Stage 1 of an automatic Unplug (`for_unplug=True`) — only
+            _on_meaningful_alert() passes this. In that case, finishing
+            Calm moves into RECOVERY_WAIT rather than back to IDLE.
         """
-        if self._calm_active:
-            return  # already showing; don't stack overlapping triggers
+        if self._mode_busy():
+            return  # already showing another intervention; don't stack
 
         try:
             from ui.calm.calm_mode import CalmMode
@@ -1536,7 +2000,11 @@ class TrayApp(QObject):
             print(f'[Canary] Could not start Calm Mode: {e}')
             return
 
+        self._active_mode = 'CALM'
         self._calm_active = True
+        self._calm_for_unplug = for_unplug
+        self._calm_run_start = time.time()
+        self._calm_run_during_session = self._session_running
         mode = CalmMode()
         self._calm_mode = mode
         mode.finished.connect(self._on_calm_finished)
@@ -1545,10 +2013,60 @@ class TrayApp(QObject):
     def _on_calm_finished(self):
         self._calm_active = False
         self._calm_mode = None
+        was_for_unplug = self._calm_for_unplug
+        self._calm_for_unplug = False
+        self._record_mode_run('calm', self._calm_run_start, time.time(),
+                               self._calm_run_during_session, completed=True,
+                               extra={'for_unplug': was_for_unplug})
+
+        if was_for_unplug:
+            # Stage 1 of the automatic Unplug chain: don't decide yet.
+            # Wait CALM_UNPLUG_RECOVERY_INTERVAL, then reassess CURRENT
+            # sustained stress (not the value that originally triggered
+            # Calm) before deciding whether Unplug is still warranted.
+            self._active_mode = 'RECOVERY_WAIT'
+            self._recovery_timer.start(int(CALM_UNPLUG_RECOVERY_INTERVAL * 1000))
+        else:
+            self._active_mode = 'IDLE'
+
+    def _on_recovery_timeout(self):
+        """
+        Fires CALM_UNPLUG_RECOVERY_INTERVAL after an alert-triggered Calm
+        completes. Re-checks session/mode state first (stale-callback
+        guard), then reassesses sustained stress via the detector's
+        smoothed live score — never a single instantaneous frame.
+        """
+        if self._active_mode != 'RECOVERY_WAIT':
+            return  # state moved on (e.g. session ended) — stale callback, ignore
+
+        if not self.detector or not self._session_running:
+            # Session ended while we were waiting — don't launch anything.
+            self._active_mode = 'IDLE'
+            self._meaningful_alert_count = 0
+            return
+
+        live   = self.detector.get_live()
+        stress = live.get('stress_score', 0.0)
+
+        # Clear RECOVERY_WAIT before deciding: trigger_unplug_mode's own
+        # _mode_busy() guard requires IDLE, and if stress has recovered we
+        # want to land in IDLE either way.
+        self._active_mode = 'IDLE'
+
+        if stress >= POST_CALM_STILL_ELEVATED_LEVEL:
+            # Still significantly elevated (or it rose again) — Unplug.
+            self.trigger_unplug_mode(automatic=True)
+        else:
+            # Sufficiently reduced/stable — cancel the pending Unplug and
+            # don't let the alerts that led here cause another one soon.
+            self._meaningful_alert_count = 0
 
     def _on_horizon_finished(self):
         """Runs once the calm eye-rest screen closes, however it closed."""
         self._horizon_active = False
+        self._active_mode = 'IDLE'
+        self._record_mode_run('horizon', self._horizon_run_start, time.time(),
+                               self._horizon_run_during_session, completed=True)
         # If the user exited while the gaze notice was up (they were
         # still looking at the screen), it must vanish right along with
         # the calm screen — _poll_detector won't touch it again now that
@@ -1591,8 +2109,27 @@ class TrayApp(QObject):
         self._no_detect_since       = None
         self._camera_ok             = True
         self._last_camera_alert_t   = 0.0
+        self._session_running       = True
+        # Phase 3: reset per-session automatic-trigger state so a previous
+        # session's alerts/stress history can't cause an immediate
+        # intervention in this new one.
+        self._meaningful_alert_count  = 0
+        self._calm_high_stress_since  = None
+        self._calm_recovered_since    = None
+        self._calm_rearmed            = True
+        # Phase 4: reset this session's usage/alert totals for the DB row
+        # that will be written when this session ends.
+        self._session_meaningful_alert_total     = 0
+        self._session_horizon_uses               = 0
+        self._session_horizon_secs               = 0.0
+        self._session_calm_uses                  = 0
+        self._session_calm_secs                  = 0.0
+        self._session_unplug_uses                = 0
+        self._session_unplug_secs                = 0.0
+        self._session_unplug_exercises_completed = 0
         self._poll_timer.start(500)
-        self._horizon_timer.start(HORIZON_INTERVAL_MS)  # 20-20-20 rule for this session
+        if self._settings.get('horizon_enabled', True):
+            self._horizon_timer.start(HORIZON_INTERVAL_MS)  # 20-20-20 rule for this session
         self.dashboard.on_session_started(list(self._history))
         self._tray_state='good'; self._icon.setIcon(_make_canary_icon('good'))
         self._icon.showMessage('Canary 🐦 — Session Started',
@@ -1603,17 +2140,88 @@ class TrayApp(QObject):
         if not self.detector: return
         self._poll_timer.stop()
         self._horizon_timer.stop()
-        detector=self.detector; self.detector=None
+        self._session_running = False
+        # Cancel any pending automatic-intervention callback so it cannot
+        # fire (and launch a mode) after the session has ended. If we were
+        # mid-recovery-wait with no mode window actually open, drop back to
+        # IDLE now rather than leaving the state machine stuck.
+        self._recovery_timer.stop()
+        if self._active_mode == 'RECOVERY_WAIT':
+            self._active_mode = 'IDLE'
+            self._meaningful_alert_count = 0
+
+        detector = self.detector
+
+        if self._active_mode == 'UNPLUG' and self._unplug_using_shared_detector:
+            # Unplug's ExerciseEnvironment/ExerciseValidationCoordinator is
+            # currently reading frames from THIS detector object via
+            # shared_detector= (see trigger_unplug_mode) — it does NOT own
+            # it and will not stop it itself. Calling detector.stop() here
+            # would release the camera out from under a still-running
+            # exercise sequence (frozen preview / progress dots that can
+            # never fill), so defer the actual stop + session bookkeeping
+            # until Unplug's own flow finishes naturally
+            # (_on_closing_done). We deliberately do NOT touch
+            # _active_mode here — Unplug's existing standalone cleanup
+            # still owns that. "Start Session" stays disabled in the
+            # meantime too — a second detector opening the camera while
+            # this one is still in use by Unplug would just contend for
+            # the same hardware.
+            self.detector = None  # tray/dashboard read this as "no active session" immediately
+            self._pending_session_detector = detector
+            self._stop_act.setEnabled(False)
+            self._tray_state = 'idle'; self._icon.setIcon(_make_canary_icon('idle'))
+            self._icon.showMessage('Canary 🐦 — Session Ending',
+                'Finishing your current Unplug break first…',
+                QSystemTrayIcon.Information, 4000)
+            return
+
         self._start_act.setEnabled(True); self._stop_act.setEnabled(False)
-        sd=detector.stop()
-        self._history.append(_session_to_dict(sd))
-        _save_history(self._history)
-        self.dashboard.on_session_ended(sd,self._history)
+        self.detector = None
+        self._finish_stopping_session(detector)
+
+    def _finish_stopping_session(self, detector: StressPostureDetector):
+        """
+        The actual detector teardown + session-end bookkeeping that used to
+        be inline in stop_session(). Split out so it can also run later,
+        deferred, when stop_session() is called mid-Unplug on the shared
+        detector (see there).
+        """
+        sd = detector.stop()
+        extra = {
+            'meaningful_alerts':          self._session_meaningful_alert_total,
+            'horizon_uses':               self._session_horizon_uses,
+            'horizon_secs':               round(self._session_horizon_secs, 1),
+            'calm_uses':                  self._session_calm_uses,
+            'calm_secs':                  round(self._session_calm_secs, 1),
+            'unplug_uses':                self._session_unplug_uses,
+            'unplug_secs':                round(self._session_unplug_secs, 1),
+            'unplug_exercises_completed': self._session_unplug_exercises_completed,
+        }
+        row = _session_to_dict(sd, extra)
+        history_db.insert_session(row)
+        self._history.append(row)
+        if len(self._history) > HISTORY_MEMORY_CAP:
+            self._history = self._history[-HISTORY_MEMORY_CAP:]
+        self.dashboard.on_session_ended(sd, self._history)
         self.show_dashboard()
+        self._start_act.setEnabled(True)
         self._tray_state='idle'; self._icon.setIcon(_make_canary_icon('idle'))
         self._icon.showMessage('Canary 🐦 — Session Ended',
             f'Duration: {sd.duration_min} min — see your report in the Dashboard.',
             QSystemTrayIcon.Information,4000)
+
+    def clear_session_history(self):
+        """
+        Phase 4: wipe stored session HISTORY only (the `sessions` table) —
+        never mode_usage (Mode Statistics has no clear action) and never
+        anything about a session currently in progress, which lives only
+        in the active detector's in-memory SessionData until it's stopped
+        and inserted, and is therefore untouched by this.
+        """
+        if history_db.clear_sessions():
+            self._history = []
+        return list(self._history)
 
     # ── Change-based alert polling ────────────────────────────────────────────
 
@@ -1648,6 +2256,15 @@ class TrayApp(QObject):
         if self._horizon_active:
             looking_at_screen = bool(self._horizon_gaze and self._horizon_gaze.looking_at_screen)
             self.overlay.set_horizon_active(looking_at_screen)
+            return
+
+        # ── Calm / Unplug / recovery-wait: suppress everything else ─────────
+        # Same principle as Horizon above — while Calm, Unplug, or the
+        # post-Calm recovery decision owns the mode slot, none of the normal
+        # RED/YELLOW/BLUE/GREEN notification path, camera-blocked alert, or
+        # tray-icon-color tracking should run, and no meaningful-alert
+        # accumulation should happen either.
+        if self._active_mode in ('CALM', 'UNPLUG', 'RECOVERY_WAIT'):
             return
 
         live = self.detector.get_live()
@@ -1690,6 +2307,11 @@ class TrayApp(QObject):
             if self._tray_state not in ('posture',):
                 self._tray_state = 'posture'
                 self._icon.setIcon(_make_canary_icon('posture'))
+            # Phase 3: this rising edge is one "meaningful alert" — a
+            # continuous posture problem only counts once, here, on the
+            # transition into it; it will not count again until it clears
+            # (posture_active goes False) and a new episode begins.
+            self._on_meaningful_alert()
         elif not posture_active and self._prev_posture_alerting:
             self._prev_posture_alerting = False
 
@@ -1698,16 +2320,72 @@ class TrayApp(QObject):
             if self._tray_state not in ('posture',):
                 self._tray_state = 'stress'
                 self._icon.setIcon(_make_canary_icon('stress'))
+            self._on_meaningful_alert()  # same edge-triggered accounting as posture above
         elif not stress_active and self._prev_stress_alerting:
             self._prev_stress_alerting = False
             if not posture_active and calibrated:
                 self._tray_state = 'good'
                 self._icon.setIcon(_make_canary_icon('good'))
 
+        # ── Automatic Calm — sustained high stress with hysteresis ──────────
+        # Independent of the stress_active/alert-popup threshold above:
+        # CALM_STRESS_THRESHOLD is its own (higher) bar, and firing requires
+        # holding above it continuously for CALM_STRESS_DURATION — a single
+        # noisy frame can't trigger it. Re-arm requires a sustained drop
+        # below CALM_RECOVERY_LEVEL, so one continuous high-stress episode
+        # cannot repeatedly retrigger Calm.
+        if (self._session_running and self._active_mode == 'IDLE' and
+                calibrated and self._settings.get('calm_enabled', True)):
+            if ss >= CALM_STRESS_THRESHOLD:
+                if self._calm_high_stress_since is None:
+                    self._calm_high_stress_since = now
+                self._calm_recovered_since = None
+                if (self._calm_rearmed and
+                        now - self._calm_high_stress_since >= CALM_STRESS_DURATION):
+                    self._calm_rearmed = False
+                    self._calm_high_stress_since = None
+                    self.trigger_calm_mode(for_unplug=False)
+            else:
+                self._calm_high_stress_since = None
+                if ss < CALM_RECOVERY_LEVEL:
+                    if self._calm_recovered_since is None:
+                        self._calm_recovered_since = now
+                    elif now - self._calm_recovered_since >= CALM_RECOVERY_DURATION:
+                        self._calm_rearmed = True
+                else:
+                    self._calm_recovered_since = None
+
         # ── Tray tooltip ──────────────────────────────────────────────────────
         self._icon.setToolTip(
             f'Canary 🐦  |  Posture: {ps:.0%}  Stress: {ss:.0%}'
             f'  Blinks: {live.get("blink_rate", 0):.0f}/min')
+
+    def _on_meaningful_alert(self):
+        """
+        Called on the rising edge of a posture or stress alert (see
+        _poll_detector) — i.e. once per distinct sustained episode, not once
+        per repeated notification/frame. Accumulates toward automatic
+        Unplug and, at threshold, launches the Calm-first (or Unplug-direct,
+        if Calm is disabled) chain — never both, and never while another
+        mode already owns the screen.
+        """
+        if not self._settings.get('unplug_enabled', True):
+            return  # disabled: don't even accumulate toward a no-op threshold
+
+        self._meaningful_alert_count += 1
+        self._session_meaningful_alert_total += 1
+
+        if self._meaningful_alert_count < UNPLUG_ALERT_THRESHOLD:
+            return
+        if self._active_mode != 'IDLE':
+            return  # re-checked at threshold time too — another mode may have started since
+        if time.time() < self._unplug_cooldown_until:
+            return  # still cooling down from a recent automatic Unplug
+
+        if self._settings.get('calm_enabled', True):
+            self.trigger_calm_mode(for_unplug=True)
+        else:
+            self.trigger_unplug_mode(automatic=True)
 
     def _on_alert(self, kind: str, score: float, signals: list = None):
         """
@@ -1720,11 +2398,11 @@ class TrayApp(QObject):
         We always show the overlay popup here.  _poll_detector handles the tray
         icon and live-dashboard event log separately (no double-overlay risk).
         """
-        if self._horizon_active:
-            # Horizon Mode shows exactly one notification type — the
-            # look-away nudge fired from _poll_detector — and nothing
-            # else, regardless of what the detector itself picks up
-            # (posture/stress/water/appreciation all suppressed here).
+        if self._active_mode != 'IDLE':
+            # Horizon, Calm, Unplug, and the post-Calm recovery wait all
+            # suppress every normal notification type (RED/YELLOW/BLUE/
+            # GREEN) — this single check covers all of them, not just
+            # Horizon, since they all now share the same _active_mode.
             return
 
         sigs = signals or []
