@@ -152,6 +152,18 @@ SIGNAL_MSGS = {
         "Classic tech neck posture. Retract your head — ears over shoulders.",
         "Cervical strain risk! Your ears should be above your shoulders.",
     ],
+    # Hardware-level camera failures — distinct from the generic 'camera'
+    # pool above (which assumes the camera is working but a face just
+    # isn't visible). These describe what's ACTUALLY wrong so the popup
+    # doesn't tell someone with no camera plugged in to "uncover" it.
+    'camera_not_found': [
+        "No camera detected. Connect a camera to start monitoring.",
+        "Camera not found — plug in a webcam (built-in or USB) to continue.",
+    ],
+    'camera_hw_blocked': [
+        "Camera stopped sending video. Check your OS camera privacy setting.",
+        "Lost the camera feed — another app may be using it, or it's disabled.",
+    ],
 }
 
 VOICE_TEXT = {
@@ -161,6 +173,10 @@ VOICE_TEXT = {
     'water':        "Break time! Drink some water!",
     'camera':       "Camera blocked. Please uncover your camera.",
     'horizon':      "Please look away from the screen",
+    # Signal-specific overrides — checked before the generic 'camera' entry
+    # above, same priority order as the popup text in push().
+    'camera_not_found':  "No camera detected. Please connect a camera.",
+    'camera_hw_blocked': "Camera feed lost. Please check your camera.",
 }
 
 THEMES = {
@@ -494,12 +510,14 @@ class NotificationOverlay(QObject):
         """
         sigs = signals or []
         msg  = None
+        voice_key = kind
 
         # Pick the most specific message based on the first recognised signal
         for sig in sigs:
             pool = SIGNAL_MSGS.get(sig)
             if pool:
                 msg = random.choice(pool)
+                voice_key = sig   # keep voice line in sync with the popup text
                 break
 
         if msg is None:
@@ -507,7 +525,7 @@ class NotificationOverlay(QObject):
 
         self._do_show.emit(kind, msg, sigs)   # queued → always delivers on main thread
         if self.voice_enabled:
-            threading.Thread(target=self._speak, args=(kind,),
+            threading.Thread(target=self._speak, args=(voice_key,),
                              daemon=True).start()
 
     def set_voice(self, enabled: bool, gender: str):

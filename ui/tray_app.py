@@ -60,8 +60,14 @@ _SETTINGS_FILE = Path.home() / '.canary_settings.json'
 
 # Alert dedup: once an alert fires, don't fire the same kind again until
 # the signal clears AND then re-appears.
-CAMERA_BLOCKED_TIMEOUT = 8.0   # seconds of no-face before camera-blocked alert
+CAMERA_BLOCKED_TIMEOUT = 8.0   # seconds of no-face (camera otherwise healthy) before alert
 CAMERA_ALERT_COOLDOWN  = 30.0  # don't spam camera alerts
+# Hardware-level failure (camera_status == 'not_found'/'blocked', reported
+# directly by the detector) is an unambiguous signal, unlike "no face seen
+# yet" — it needs only a brief debounce against a single missed poll, not
+# the full CAMERA_BLOCKED_TIMEOUT, and it fires whether or not calibration
+# has completed (it never will without frames in the first place).
+CAMERA_HW_ALERT_GRACE  = 1.0
 
 HORIZON_INTERVAL_MS      = 20 * 60 * 1000  # 20-20-20 rule: every 20 minutes during an active session
 HORIZON_LOOKAWAY_COOLDOWN = 15.0            # seconds between "please look away" nudges while Horizon Mode is active
@@ -1558,6 +1564,7 @@ class TrayApp(QObject):
         self._last_camera_alert_t   = 0.0
         self._no_detect_since: Optional[float] = None  # first time face went missing
         self._camera_ok = True
+        self._camera_hw_bad_since: Optional[float] = None  # first time camera_status went bad
 
         # ── Horizon Mode (20-20-20) state ─────────────────────────────────────
         # _horizon_active: True for the whole time the calm eye-rest screen is
@@ -2108,6 +2115,7 @@ class TrayApp(QObject):
         self._prev_stress_alerting  = False
         self._no_detect_since       = None
         self._camera_ok             = True
+        self._camera_hw_bad_since   = None
         self._last_camera_alert_t   = 0.0
         self._session_running       = True
         # Phase 3: reset per-session automatic-trigger state so a previous
@@ -2270,13 +2278,55 @@ class TrayApp(QObject):
         live = self.detector.get_live()
         now  = time.time()
 
-        calibrated = live.get('calibrated', False)
-        face_ok    = live.get('face_detected', False) or live.get('pose_detected', False)
+        calibrated    = live.get('calibrated', False)
+        face_ok       = live.get('face_detected', False) or live.get('pose_detected', False)
+        camera_status = live.get('camera_status', 'ok')
 
-        # ── Camera-blocked detection ──────────────────────────────────────────
-        # The detector has no concept of "camera physically blocked"; it just
-        # stops seeing a face.  We handle it here after CAMERA_BLOCKED_TIMEOUT.
-        if calibrated:
+        # ── Hardware-level camera failure (not found / not connected / ─────────
+        #    stopped delivering frames) ──────────────────────────────────────
+        # This is a hard, unambiguous signal reported directly by the
+        # detector's camera-open/read loop — not a judgement based on
+        # mediapipe seeing a face. It fires whether or not calibration has
+        # ever completed (waiting for "calibrated" here would mean it never
+        # fires at all when the camera never worked in the first place —
+        # calibration can't progress without frames), and needs only a brief
+        # debounce, not the long face-not-detected timeout below.
+        if camera_status in ('not_found', 'blocked'):
+            if self._camera_hw_bad_since is None:
+                self._camera_hw_bad_since = now
+            elif (now - self._camera_hw_bad_since >= CAMERA_HW_ALERT_GRACE and
+                  now - self._last_camera_alert_t >= CAMERA_ALERT_COOLDOWN):
+                self._last_camera_alert_t = now
+                self._camera_ok = False
+                hw_signal = ('camera_not_found' if camera_status == 'not_found'
+                             else 'camera_hw_blocked')
+                self.overlay.push('camera', [hw_signal])
+                self._fire_camera_alert(camera_status)
+                ts = now
+                detail = ('Camera not found' if camera_status == 'not_found'
+                           else 'Camera stopped sending video')
+                QTimer.singleShot(0, lambda: self.dashboard.add_live_event(
+                    ts, 'camera', detail))
+            # Camera is hardware-unhealthy right now — the softer
+            # "no face yet" check below would be meaningless (there's no
+            # real frame to judge), so don't let it also start counting.
+            self._no_detect_since = None
+        else:
+            self._camera_hw_bad_since = None
+
+            # ── Soft "no face" detection (camera healthy, but lens covered, ─
+            #    shutter closed, or nobody in frame) ────────────────────────
+            # The detector has no concept of "camera physically blocked" at
+            # this level; it just stops seeing a face in an otherwise-fine
+            # frame. This runs from the moment the session starts — including
+            # all through the ~30 s calibration window, not just after — 
+            # because if the camera is covered/off/nobody's there, calibration
+            # can never complete on its own, so waiting for "calibrated"
+            # first would mean this alert never fires at all in exactly the
+            # case it's meant to catch. A brief gap (someone leaning out of
+            # frame for a second) is normal and ignored; only a sustained
+            # CAMERA_BLOCKED_TIMEOUT with no face is treated as a real block,
+            # which is what keeps this from firing on a momentary blip.
             if not face_ok:
                 if self._no_detect_since is None:
                     self._no_detect_since = now
@@ -2286,7 +2336,7 @@ class TrayApp(QObject):
                     self._camera_ok = False
                     # Camera alert goes through overlay directly (not via detector)
                     self.overlay.push('camera', [])
-                    self._fire_camera_alert()
+                    self._fire_camera_alert('face_not_detected')
                     ts = now
                     QTimer.singleShot(0, lambda: self.dashboard.add_live_event(
                         ts, 'camera', 'Face not detected'))
@@ -2424,15 +2474,35 @@ class TrayApp(QObject):
         QTimer.singleShot(0, lambda: self.dashboard.add_live_event(
             now, kind, detail))
 
-    def _fire_camera_alert(self):
-        """Show tray notification for camera blocked."""
+    def _fire_camera_alert(self, reason: str = 'face_not_detected'):
+        """
+        Show tray notification for a camera problem. `reason` distinguishes
+        a genuine hardware failure (no camera found, or one that stopped
+        delivering frames — reported by the detector's camera_status) from
+        the softer post-calibration "no face seen" case, so the message
+        the user gets actually matches what's wrong.
+        """
         self._tray_state = 'camera'
         self._icon.setIcon(_make_canary_icon('camera'))
-        self._icon.showMessage(
+        title, body = {
+            'not_found': (
+                'Canary 🐦 — Camera Not Found',
+                'No camera could be detected.\n'
+                'Connect a camera (built-in or USB) to start monitoring.'),
+            'blocked': (
+                'Canary 🐦 — Camera Blocked',
+                'Your camera stopped sending video.\n'
+                'Check your OS camera privacy setting, or close any other '
+                'app that may be using it.'),
+            'face_not_detected': (
+                'Canary 🐦 — Camera Blocked',
+                'Face not detected for 8 s. Posture & stress monitoring paused.\n'
+                'Uncover your camera or adjust your position.'),
+        }.get(reason, (
             'Canary 🐦 — Camera Blocked',
             'Face not detected for 8 s. Posture & stress monitoring paused.\n'
-            'Unblock your camera or adjust your position.',
-            QSystemTrayIcon.Warning, 6000)
+            'Uncover your camera or adjust your position.'))
+        self._icon.showMessage(title, body, QSystemTrayIcon.Warning, 6000)
         QTimer.singleShot(10000, self._reset_icon)
 
     # ── Icon helpers ──────────────────────────────────────────────────────────

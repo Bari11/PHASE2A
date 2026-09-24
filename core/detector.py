@@ -43,6 +43,7 @@ import time
 import threading
 import urllib.request
 import os
+import sys
 from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Dict, Callable, Optional, Tuple
@@ -491,11 +492,24 @@ class StressPostureDetector:
     """
 
     # ── Timing ────────────────────────────────────────────────────────────────
-    CALIB_DURATION_SEC      = 30     # hard cap on calibration window
+    CALIB_DURATION_SEC      = 30     # required VISIBLE seconds (not wall-clock)
+    CALIB_WALLCLOCK_CEILING = CALIB_DURATION_SEC * 10   # last-resort safety valve
     MIN_CALIB_SAMPLES       = 20     # complete calibration early if ≥ 20 clean frames
     CALIB_SAMPLE_INTERVAL   = 0.35   # sample rate during calibration
     SUSTAINED_SEC           = 5.0    # signal must hold this long before firing alert
     HISTORY_SAMPLE_INTERVAL = 0.35   # live history sample rate
+
+    # ── Camera health ─────────────────────────────────────────────────────────
+    # These govern the "camera not found / not working / blocked" signal that
+    # is reported via _live['camera_status'], independent of and prior to
+    # calibration. This is a hardware/driver-level signal (no frames arriving
+    # at all) — distinct from mediapipe simply not seeing a face in an
+    # otherwise-healthy frame, which stays a calibrated-only, longer-sustained
+    # judgement made by the caller (see ui/tray_app.py _poll_detector).
+    CAMERA_OPEN_INDEX_RANGE  = 6      # device indices to probe (0..N-1)
+    CAMERA_OPEN_READ_TRIES   = 10     # frame reads attempted before trusting a device
+    CAMERA_OPEN_RETRY_SEC    = 2.0    # how often to re-probe after a failed open
+    CAMERA_READ_FAIL_SEC     = 3.0    # consecutive read failures before declaring "blocked"
 
     # ── Alert cooldowns ───────────────────────────────────────────────────────
     COOLDOWNS = {
@@ -592,6 +606,12 @@ class StressPostureDetector:
         self._calib:       Dict[str, list] = {k: [] for k in self._baseline}
         self._calib_start: Optional[float] = None
         self._calib_done:  bool            = False
+        # Calibration must only "spend" its 30 s budget on time the person
+        # was actually visible — a blocked/covered camera must not be able
+        # to run the clock out and lock in a fabricated baseline. This
+        # accumulates real visible seconds only (see _process), separate
+        # from wall-clock elapsed time.
+        self._calib_visible_secs: float    = 0.0
 
         # Rolling metric histories  (covers ~4 s at 2.5 Hz → 10 samples)
         N = 20
@@ -628,6 +648,7 @@ class StressPostureDetector:
         self.session          = SessionData(start_time=time.time())
         self._calib_start     = time.time()
         self._calib_done      = False
+        self._calib_visible_secs = 0.0
         for k in self._calib:     self._calib[k].clear()
         for k in self._baseline:  self._baseline[k] = None
         for k in self._sustained_since: self._sustained_since[k] = None
@@ -658,7 +679,12 @@ class StressPostureDetector:
     def calib_progress(self) -> float:
         if self._calib_start is None: return 0.0
         if self._calib_done:          return 100.0
-        time_pct   = (time.time() - self._calib_start) / self.CALIB_DURATION_SEC * 100
+        # Reflects time the person was actually VISIBLE, not wall-clock
+        # time since the session started — otherwise the bar keeps
+        # climbing while the camera is blocked/covered, which is
+        # misleading: nothing is actually being learned about the person
+        # during that time.
+        time_pct   = self._calib_visible_secs / self.CALIB_DURATION_SEC * 100
         counts     = [len(v) for v in self._calib.values() if v]
         sample_pct = (min(counts) / self.MIN_CALIB_SAMPLES * 100) if counts else 0
         return min(max(time_pct, sample_pct), 99.9)
@@ -669,21 +695,104 @@ class StressPostureDetector:
 
     # ── Camera loop ───────────────────────────────────────────────────────────
 
+    def _open_camera(self) -> Optional['cv2.VideoCapture']:
+        """
+        Probe for an available camera and hand back the first one that
+        actually delivers frames.
+
+        isOpened() alone is not trustworthy: a device can report
+        isOpened()==True while never producing a real frame — e.g. an
+        OS-level privacy block (camera access toggled off), the device
+        being held exclusively by another app, or a dead/disconnected
+        index that the driver still lists. Each candidate is therefore
+        read-tested before being trusted.
+
+        Every index is tried, not just index 0, so an external/USB
+        webcam is picked up naturally whether it's the laptop's only
+        camera or sits alongside a built-in one. On Windows, DSHOW is
+        tried before the default backend since it opens many USB
+        webcams that the default MSMF backend fails to (or opens but
+        never reads from).
+        """
+        backends = [cv2.CAP_DSHOW, cv2.CAP_ANY] if sys.platform.startswith('win') \
+            else [cv2.CAP_ANY]
+        for idx in range(self.CAMERA_OPEN_INDEX_RANGE):
+            for backend in backends:
+                try:
+                    c = (cv2.VideoCapture(idx, backend) if backend != cv2.CAP_ANY
+                         else cv2.VideoCapture(idx))
+                except Exception:
+                    continue
+                if not c.isOpened():
+                    c.release(); continue
+                ok = False
+                for _ in range(self.CAMERA_OPEN_READ_TRIES):
+                    ret, _ = c.read()
+                    if ret:
+                        ok = True; break
+                    time.sleep(0.05)
+                if ok:
+                    return c
+                c.release()
+        return None
+
+    def _publish_camera_status(self, status: str):
+        """
+        Report camera hardware health independently of calibration/face
+        detection — 'not_found' (no device could be opened) or 'blocked'
+        (a previously-working device has stopped delivering frames), or
+        'ok'. Consumed by ui/tray_app.py to fire the camera alert
+        immediately rather than waiting on calibration to ever complete
+        (which it never will without frames).
+        """
+        with self._live_lock:
+            live = dict(self._live)
+            live['camera_status'] = status
+            if status != 'ok':
+                live['face_detected'] = False
+                live['pose_detected'] = False
+                live['calibrated']    = self._calib_done
+            self._live = live
+
     def _loop(self):
-        cap = None
-        for idx in range(4):
-            c = cv2.VideoCapture(idx)
-            if c.isOpened():
-                cap = c; break
+        cap = self._open_camera()
         if cap is None:
-            return
+            # No camera at all yet — report it immediately so the UI can
+            # alert right away, then keep quietly retrying in the
+            # background in case one is connected afterwards (e.g. an
+            # external webcam plugged in after the session started, or a
+            # blocked/held device that frees up).
+            self._publish_camera_status('not_found')
+            while self._running:
+                time.sleep(self.CAMERA_OPEN_RETRY_SEC)
+                cap = self._open_camera()
+                if cap is not None:
+                    self._publish_camera_status('ok')
+                    break
+            if cap is None:
+                return
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 15)
+
+        read_fail_since: Optional[float] = None
+        reported_blocked = False
+
         while self._running:
             ret, frame = cap.read()
             if not ret:
+                now = time.time()
+                if read_fail_since is None:
+                    read_fail_since = now
+                elif (not reported_blocked and
+                      now - read_fail_since >= self.CAMERA_READ_FAIL_SEC):
+                    reported_blocked = True
+                    self._publish_camera_status('blocked')
                 time.sleep(0.05); continue
+            if reported_blocked:
+                reported_blocked = False
+                self._publish_camera_status('ok')
+            read_fail_since = None
             self._frame_n += 1
             if self._frame_n % 2 == 0:          # ~7 fps effective
                 flipped = cv2.flip(frame, 1)
@@ -710,34 +819,52 @@ class StressPostureDetector:
 
         # ── Calibration ───────────────────────────────────────────────────────
         if not self._calib_done and self._calib_start is not None:
+            person_visible = bool(m.get('face_detected') or m.get('pose_detected'))
             if now - self._last_calib_t >= self.CALIB_SAMPLE_INTERVAL:
                 self._last_calib_t = now
                 if m.get('face_detected'):
                     for key in self._calib:
                         if m.get(key) is not None:
                             self._calib[key].append(m[key])
-                    # blink_rate is face-independent but accumulates naturally
+                    # blink_rate needs a real, currently-visible face to mean
+                    # anything — sampling it unconditionally let calibration
+                    # complete purely from wall-clock ticks while the camera
+                    # was blocked the whole time (blink_rate decays toward 0
+                    # with no face to read, which looked like valid samples).
                     self._calib['blink_rate'].append(float(m.get('blink_rate', 0)))
 
                 # Session accounting during calibration
                 self.session.stress_samples.append(0.0)
                 self.session.posture_samples.append(0.0)
                 self.session.blink_samples.append(float(m.get('blink_rate', 0)))
-                if m.get('face_detected') or m.get('pose_detected'):
+                if person_visible:
                     self.session.good_posture_secs += self.CALIB_SAMPLE_INTERVAL
+                    self._calib_visible_secs        += self.CALIB_SAMPLE_INTERVAL
                     if self._good_streak_start is None:
                         self._good_streak_start = now
                 else:
                     self.session.no_detection_secs += self.CALIB_SAMPLE_INTERVAL
                     self._good_streak_start = None
 
-            # Check if calibration is complete
-            elapsed        = now - self._calib_start
+            # Check if calibration is complete. time_expired is based on
+            # _calib_visible_secs (real visible seconds), NOT wall-clock time
+            # since the session started — a blocked/covered camera, or nobody
+            # sitting down yet, must never be able to run this clock out and
+            # lock in a fabricated baseline (see _finalise_calibration's
+            # DEFAULTS, which exist only as a last-resort fallback for the
+            # odd missing metric, not as a substitute for actually seeing the
+            # person for 30 real seconds). Calibration simply keeps waiting —
+            # the camera-blocked alert (ui/tray_app.py) is what tells the
+            # user something needs fixing in the meantime. CALIB_WALLCLOCK_CEILING
+            # is only a last-resort safety valve (10x the normal window) so a
+            # persistently flaky-but-technically-working detector can't leave
+            # the app stuck calibrating forever.
             face_counts    = [len(v) for v in self._calib.values() if v]
             enough_samples = bool(face_counts) and min(face_counts) >= self.MIN_CALIB_SAMPLES
-            time_expired   = elapsed >= self.CALIB_DURATION_SEC
+            time_expired   = self._calib_visible_secs >= self.CALIB_DURATION_SEC
+            wallclock_cap  = (now - self._calib_start) >= self.CALIB_WALLCLOCK_CEILING
 
-            if enough_samples or time_expired:
+            if enough_samples or time_expired or wallclock_cap:
                 self._finalise_calibration()
 
         # ── Compute signal states ─────────────────────────────────────────────
@@ -776,6 +903,7 @@ class StressPostureDetector:
             calib_pct      = round(self.calib_progress(), 1),
             active_signals = [s for s in self.ALL_SIGNALS if states.get(s)],
             detection_mode = self._backend.mode,
+            camera_status  = 'ok',
         )
         with self._live_lock:
             self._live = dict(m)
@@ -811,6 +939,17 @@ class StressPostureDetector:
         if not self._calib_done:
             return states
 
+        # Nothing to judge if nobody is currently visible. Without this,
+        # per-frame values that quietly default/decay when there's no face
+        # or pose to read (blink_rate ages toward 0 with no blinks to see;
+        # stale rolling-history averages from before the person left frame)
+        # look exactly like real deviations and fire false alerts for a
+        # posture or expression that isn't actually happening right now.
+        face_seen = bool(m.get('face_detected'))
+        pose_seen = bool(m.get('pose_detected'))
+        if not face_seen and not pose_seen:
+            return states
+
         MIN_H = 8   # need ≥ 4 history samples before judging (~1.4 s)
 
         def ravg(key: str, n: int = 12) -> Optional[float]:
@@ -836,48 +975,50 @@ class StressPostureDetector:
             ref = abs(b) if b != 0 else 1e-6
             return (cur - b) / ref >= threshold
 
-        # ── Eye signals ───────────────────────────────────────────────────────
-        br   = float(m.get('blink_rate', 0))
-        b_br = base('blink_rate') or self.BLINK_NORMAL_LOW
-        if br < max(b_br * self.BLINK_LOW_RATIO, 1.5):
-            states['blink_low']  = True
-        if br > b_br * self.BLINK_HIGH_RATIO:
-            states['blink_high'] = True
-        if pct_drop('eye_ear', self.EYE_NARROW_PCT):
-            states['eye_narrow'] = True
+        # ── Face-based signals — require an actual face in THIS frame ──────────
+        # (blink/eye/brow/mouth/head metrics all come from face landmarks; a
+        # stale rolling average from before the face left frame is not
+        # enough on its own to justify firing something for right now.)
+        if face_seen:
+            br   = float(m.get('blink_rate', 0))
+            b_br = base('blink_rate') or self.BLINK_NORMAL_LOW
+            if br < max(b_br * self.BLINK_LOW_RATIO, 1.5):
+                states['blink_low']  = True
+            if br > b_br * self.BLINK_HIGH_RATIO:
+                states['blink_high'] = True
+            if pct_drop('eye_ear', self.EYE_NARROW_PCT):
+                states['eye_narrow'] = True
 
-        # ── Brow signals ──────────────────────────────────────────────────────
-        if pct_drop('brow_inner_dist', self.BROW_CONTRACT_PCT):
-            states['brow_contract'] = True
-        # brow_y increasing = brows moving DOWN (Y axis goes down in image coords)
-        if pct_rise('brow_y', self.BROW_LOWER_PCT):
-            states['brow_lower'] = True
+            if pct_drop('brow_inner_dist', self.BROW_CONTRACT_PCT):
+                states['brow_contract'] = True
+            # brow_y increasing = brows moving DOWN (Y axis goes down in image coords)
+            if pct_rise('brow_y', self.BROW_LOWER_PCT):
+                states['brow_lower'] = True
 
-        # ── Mouth / jaw signals ───────────────────────────────────────────────
-        if pct_drop('lip_gap', self.LIP_PRESS_PCT):
-            states['lip_press'] = True
-        # mouth_corner_delta rising = corners pulling DOWN (frown)
-        if pct_rise('mouth_corner_delta', self.MOUTH_DOWN_PCT):
-            states['mouth_down'] = True
+            if pct_drop('lip_gap', self.LIP_PRESS_PCT):
+                states['lip_press'] = True
+            # mouth_corner_delta rising = corners pulling DOWN (frown)
+            if pct_rise('mouth_corner_delta', self.MOUTH_DOWN_PCT):
+                states['mouth_down'] = True
 
-        # ── Head posture signals ──────────────────────────────────────────────
-        # face_size grows → leaning toward screen
-        if pct_rise('face_size', self.FACE_FORWARD_PCT):
-            states['forward_head'] = True
-        # head_y rises → nose moving down in frame (head drooping)
-        if pct_rise('head_y', self.HEAD_DROOP_PCT):
-            states['head_droop'] = True
+            # face_size grows → leaning toward screen
+            if pct_rise('face_size', self.FACE_FORWARD_PCT):
+                states['forward_head'] = True
+            # head_y rises → nose moving down in frame (head drooping)
+            if pct_rise('head_y', self.HEAD_DROOP_PCT):
+                states['head_droop'] = True
 
-        # ── Shoulder / body signals ───────────────────────────────────────────
-        # shoulder_forward rises → shoulders rounding forward
-        if pct_rise('shoulder_forward', self.SHOULDER_FWD_PCT):
-            states['rounded_shld'] = True
-        # shoulder_y drops → shoulders elevated toward ears
-        if pct_drop('shoulder_y', self.SHOULDER_ELEV_PCT):
-            states['elevated_shld'] = True
-        # ear_shoulder_z rises → ears further in front of shoulders (tech neck)
-        if pct_rise('ear_shoulder_z', self.TECH_NECK_PCT):
-            states['tech_neck'] = True
+        # ── Shoulder / body signals — require pose landmarks in THIS frame ──────
+        if pose_seen:
+            # shoulder_forward rises → shoulders rounding forward
+            if pct_rise('shoulder_forward', self.SHOULDER_FWD_PCT):
+                states['rounded_shld'] = True
+            # shoulder_y drops → shoulders elevated toward ears
+            if pct_drop('shoulder_y', self.SHOULDER_ELEV_PCT):
+                states['elevated_shld'] = True
+            # ear_shoulder_z rises → ears further in front of shoulders (tech neck)
+            if pct_rise('ear_shoulder_z', self.TECH_NECK_PCT):
+                states['tech_neck'] = True
 
         return states
 
