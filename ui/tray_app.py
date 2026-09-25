@@ -34,6 +34,21 @@ from core.detector      import StressPostureDetector, SessionData
 from core.notifications import NotificationOverlay
 from core import history_db
 
+# ── App branding assets ──────────────────────────────────────────────────────
+# Resolved relative to this file's location (repo_root/ui/tray_app.py), so it
+# works regardless of the process's current working directory.
+_REPO_ROOT           = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_LOGO_WORDMARK_PATH  = os.path.join(_REPO_ROOT, 'assets', 'logo.png')       # dashboard header
+_LOGO_ICON_PATH      = os.path.join(_REPO_ROOT, 'assets', 'logo_icon.png')  # window/app icon
+
+
+def _load_app_icon() -> Optional[QIcon]:
+    """The app-wide icon (window/taskbar) — falls back to None (Qt/OS default)
+    if the asset is missing, rather than crashing the app over branding."""
+    if os.path.isfile(_LOGO_ICON_PATH):
+        return QIcon(_LOGO_ICON_PATH)
+    return None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Palette
@@ -1337,6 +1352,9 @@ class DashboardWindow(QMainWindow):
         super().__init__()
         self._tray=tray_ref; self._settings=dict(settings)
         self.setWindowTitle('🐦  Canary')
+        app_icon = _load_app_icon()
+        if app_icon is not None:
+            self.setWindowIcon(app_icon)
         self.setMinimumSize(900,660); self.resize(1000,720)
         self.setStyleSheet(f'background:{C["bg"]};color:{C["text"]};')
 
@@ -1349,12 +1367,17 @@ class DashboardWindow(QMainWindow):
         hbar.setStyleSheet(f'QFrame{{background:{C["card"]};border-bottom:1px solid {C["border"]}}}')
         hl=QHBoxLayout(hbar); hl.setContentsMargins(24,0,24,0)
         lr=QHBoxLayout(); lr.setSpacing(10)
-        logo=QLabel('🐦'); logo.setStyleSheet('font-size:22pt;background:transparent;')
-        lr.addWidget(logo)
-        name_lbl=QLabel('Canary')
-        name_lbl.setStyleSheet(f'color:{C["purple"]};font-size:15pt;'
+        logo=QLabel(); logo.setStyleSheet('background:transparent;')
+        if os.path.isfile(_LOGO_WORDMARK_PATH):
+            logo_pix = QPixmap(_LOGO_WORDMARK_PATH)
+            logo.setPixmap(logo_pix.scaledToHeight(36, Qt.SmoothTransformation))
+        else:
+            # Asset missing — fall back to the old text mark rather than an
+            # empty header.
+            logo.setText('Canary')
+            logo.setStyleSheet(f'color:{C["purple"]};font-size:15pt;'
                                 f'font-weight:bold;background:transparent;')
-        lr.addWidget(name_lbl)
+        lr.addWidget(logo)
         hl.addLayout(lr); hl.addStretch()
 
         self._status_badge=QLabel('⬤  Inactive')

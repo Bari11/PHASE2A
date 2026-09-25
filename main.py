@@ -55,15 +55,21 @@ check_deps()
 
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon
 from PyQt5.QtCore    import Qt
+from PyQt5.QtGui     import QIcon
 
 QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
 QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,    True)
+
+_APP_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'assets', 'logo_icon.png')
 
 
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName('Canary')
     app.setQuitOnLastWindowClosed(False)   # keep alive in tray
+    if os.path.isfile(_APP_ICON_PATH):
+        app.setWindowIcon(QIcon(_APP_ICON_PATH))
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         print('ERROR: No system tray found on this platform.')
